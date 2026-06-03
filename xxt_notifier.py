@@ -679,79 +679,25 @@ class XuexitongClient:
 
     def get_course_unfinished(self, course: dict) -> list:
         """
-        获取课程中所有未完成的章节点
-        解析 studentcourse 页面中的 knowledgeJobCount
-        每个章节可能有多个任务（视频、作业、考试等）
-
-        返回: [(章节标题, 未完成任务数), ...]
+        Get course direct unfinished homework and exams.
+        Returns: [(Task Name, 1), ...] (for status aggregation)
         """
-        course_id = course.get("courseId", "")
-        clazz_id = course.get("clazzId", "")
-        cpi = course.get("cpi", "")
-        if not all([course_id, clazz_id, cpi]):
+        tokens = self.get_course_tokens(course)
+        if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
             return []
 
-        url = f"{COURSE_DETAIL_URL}?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ut=s"
-        try:
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code != 200:
-                return []
-
-            unfinished = []
-            html = resp.text
-
-            # 解析章节单元
-            # 每个 chapter_unit 包含多个 li，每个 li 代表一个章节点
-            chapter_units = re.findall(
-                r'<div class="chapter_unit"[^>]*>(.*?)</div>\s*</div>',
-                html,
-                re.DOTALL,
-            )
-
-            for unit_html in chapter_units:
-                # 提取章节点
-                points = re.findall(
-                    r'<li[^>]*>.*?<div[^>]*id="(cur\d+)"[^>]*>.*?</div>\s*</li>',
-                    unit_html,
-                    re.DOTALL,
-                )
-
-                for point_id in points:
-                    # 提取标题
-                    title_match = re.search(
-                        r'id="' + re.escape(point_id) + r'"[^>]*>.*?'
-                        r'<a[^>]*class="clicktitle"[^>]*>(.*?)</a>',
-                        html,
-                        re.DOTALL,
-                    )
-                    title = title_match.group(1).strip() if title_match else point_id
-
-                    # 提取未完成任务数
-                    count_match = re.search(
-                        r'<input[^>]*class="knowledgeJobCount"[^>]*value="(\d+)"',
-                        html,
-                    )
-                    # 更精确：找当前 point 附近的 knowledgeJobCount
-                    # 用 point_id 定位附近的 knowledgeJobCount
-                    point_pos = html.find(f'id="{point_id}"')
-                    if point_pos >= 0:
-                        nearby = html[point_pos : point_pos + 1500]
-                        count_match = re.search(
-                            r'knowledgeJobCount[^>]*value="(\d+)"', nearby
-                        )
-                        if count_match:
-                            count = int(count_match.group(1))
-                            if count > 0:
-                                unfinished.append((title, count))
-                        else:
-                            # 没有 JobCount 表示已完成，跳过
-                            pass
-
-            return unfinished
-
-        except Exception as e:
-            print(f"[章节] {course.get('title', course_id)} 查询失败: {e}")
-            return []
+        hws = self._get_homework_list(course, tokens)
+        exams = self._get_exam_list(course, tokens)
+        
+        unfinished = []
+        for h in hws:
+            if h["status"] in ["未交", "进行中", "待做"]:
+                unfinished.append((h["name"], 1))
+        for e in exams:
+            if e["status"] in ["未交", "进行中", "待做"]:
+                unfinished.append((e["name"], 1))
+                
+        return unfinished
 
     # ----- 章节卡片（未完成任务清单）-----
 
@@ -863,65 +809,41 @@ class XuexitongClient:
 
     def get_unfinished_tasks(self, courses: Optional[list] = None) -> list:
         """
-        获取所有课程中未完成的作业/考试
-        流程：遍历课程 → 取有未完成任务的章节 → 拉章节卡片 → 过滤出 workid 类型
-        类型识别直接用 attachment 的 property.worktype（无需 HTTP 探测）
-        返回: list[dict]，每个 dict 含 course/course_id/clazz_id/cpi/chapter/knowledge_id/workid/type/url/name
+        Get independent unfinished homework and exams directly from course tabs.
         """
         if courses is None:
             courses = self.get_course_list()
         results = []
         total_courses = len(courses)
         scanned = 0
+        
         for course in courses:
             scanned += 1
             title = course.get("title") or course.get("courseId", "未知课程")
-            course_id = course.get("courseId", "")
-            clazz_id = course.get("clazzId", "")
-            cpi = course.get("cpi", "")
-            if not all([course_id, clazz_id, cpi]):
+            
+            # Fetch landing page tokens
+            tokens = self.get_course_tokens(course)
+            if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
                 continue
-            chapters = self.get_course_unfinished_chapters(course)
-            if not chapters:
-                continue
-            print(f"[{scanned}/{total_courses}] {title} - {len(chapters)} 个未完成章节")
-            for ch in chapters:
-                kid = ch["knowledge_id"]
-                atts = self.get_chapter_attachments(course_id, clazz_id, kid)
-                # 筛选作业/考试：attachment 包含 workid 字段
-                work_atts = [a for a in atts if a.get("workid")]
-                if work_atts:
-                    print(f"  [命中] {ch['title']} - {len(work_atts)} 个 workid")
-                for a in work_atts:
-                    workid = a["workid"]
-                    worktype = a.get("worktype")
-                    ttype = self.classify_task(worktype)
-                    task_name = a.get("name") or ""
-                    # 构造 URL（按类型）
-                    if ttype == "考试":
-                        url = (
-                            f"{EXAM_TEST_URL}?workId={workid}&classId={clazz_id}"
-                            f"&cpi={cpi}&knowledgeId={kid}&ut=s"
-                        )
-                    else:
-                        url = (
-                            f"{WORK_HOMEWORK_URL}?workId={workid}&classId={clazz_id}"
-                            f"&cpi={cpi}&knowledgeId={kid}&ut=s"
-                        )
-                    results.append({
-                        "course": title,
-                        "course_id": course_id,
-                        "clazz_id": clazz_id,
-                        "cpi": cpi,
-                        "chapter": ch["title"],
-                        "knowledge_id": kid,
-                        "workid": workid,
-                        "type": ttype,
-                        "name": task_name,
-                        "worktype": worktype,
-                        "url": url,
-                    })
-                time.sleep(0.4)
+
+            # Fetch homework and exams
+            hws = self._get_homework_list(course, tokens)
+            exams = self._get_exam_list(course, tokens)
+            
+            # Filter for unfinished ones
+            # Unfinished if status in ["未交", "进行中", "待做"]
+            unfinished_hws = [h for h in hws if h["status"] in ["未交", "进行中", "待做"]]
+            unfinished_exams = [e for e in exams if e["status"] in ["未交", "进行中", "待做"]]
+            
+            if unfinished_hws or unfinished_exams:
+                print(f"[{scanned}/{total_courses}] {title} - 未完成作业: {len(unfinished_hws)}，未完成考试: {len(unfinished_exams)}")
+                
+            results.extend(unfinished_hws)
+            results.extend(unfinished_exams)
+            
+            # Avoid rate limits
+            time.sleep(0.5)
+            
         return results
 
     # ----- 活跃活动（签到等）-----
@@ -1167,33 +1089,49 @@ def list_unfinished_tasks(client: XuexitongClient, output_file: Optional[Path] =
 
 def print_tasks_table(tasks: list):
     """
-    打印未完成作业/考试的控制台表格。
-    格式：编号 | 课程 | 章节 | 类型 | 链接
+    Print table formatting: # | Course | Task Name | Type | Status | Deadline | Link
     """
     if not tasks:
         print("  (无)")
         return
-    # 计算列宽
+        
     def truncate(s: str, n: int) -> str:
-        s = str(s)
+        s = str(s).replace("\u200b", "")
+        try:
+            enc = sys.stdout.encoding or "utf-8"
+            s = s.encode(enc, errors="replace").decode(enc)
+        except Exception:
+            pass
         return s if len(s) <= n else s[: n - 1] + "…"
 
     course_w = max(len("课程"), min(20, max(len(t["course"]) for t in tasks)))
-    chapter_w = max(len("章节"), min(28, max(len(t["chapter"]) for t in tasks)))
+    name_w = max(len("任务名称"), min(25, max(len(t["name"]) for t in tasks)))
     type_w = 6
+    status_w = 6
+    deadline_w = max(len("截止时间"), min(20, max(len(t["deadline"]) for t in tasks)))
     idx_w = max(4, len(str(len(tasks))))
 
-    header = f"{'#':>{idx_w}}  {'课程':<{course_w}}  {'章节':<{chapter_w}}  {'类型':<{type_w}}  链接"
+    header = f"{'#':>{idx_w}}  {'课程':<{course_w}}  {'任务名称':<{name_w}}  {'类型':<{type_w}}  {'状态':<{status_w}}  {'截止时间':<{deadline_w}}  链接"
     sep = "-" * len(header)
     print(sep)
     print(header)
     print(sep)
     for i, t in enumerate(tasks, 1):
         course = truncate(t["course"], course_w)
-        chapter = truncate(t["chapter"], chapter_w)
+        name = truncate(t["name"], name_w)
         ttype = t["type"]
+        status = t["status"]
+        deadline = truncate(t["deadline"], deadline_w)
         url = t["url"]
-        print(f"{i:>{idx_w}}  {course:<{course_w}}  {chapter:<{chapter_w}}  {ttype:<{type_w}}  {url}")
+        line = f"{i:>{idx_w}}  {course:<{course_w}}  {name:<{name_w}}  {ttype:<{type_w}}  {status:<{status_w}}  {deadline:<{deadline_w}}  {url}"
+        try:
+            print(line)
+        except Exception:
+            try:
+                enc = sys.stdout.encoding or "utf-8"
+                print(line.encode(enc, errors="replace").decode(enc))
+            except Exception:
+                print(line.encode("ascii", errors="replace").decode("ascii"))
     print(sep)
 
 
