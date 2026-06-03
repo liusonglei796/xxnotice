@@ -546,6 +546,66 @@ class XuexitongClient:
             print(f"[错误] 获取课程 {course.get('title')} 的Token失败: {e}")
             return {}
 
+    def _get_homework_list(self, course: dict, tokens: dict) -> list:
+        """
+        Fetch the homework page, decode as UTF-8, and parse list items.
+        """
+        course_id = course.get("courseId", "")
+        clazz_id = course.get("clazzId", "")
+        cpi = course.get("cpi", "")
+        work_enc = tokens.get("workEnc")
+        enc = tokens.get("enc")
+        t = tokens.get("t")
+
+        if not all([course_id, clazz_id, cpi, work_enc, enc, t]):
+            return []
+
+        url = f"https://mooc1.chaoxing.com/mooc2/work/list?courseId={course_id}&classId={clazz_id}&cpi={cpi}&ut=s&t={t}&stuenc={enc}&enc={work_enc}"
+        try:
+            resp = self.session.get(url, timeout=15)
+            # Homework page is UTF-8 encoded
+            html = resp.content.decode('utf-8', errors='ignore')
+            
+            tasks = []
+            # Find list items with onclick="goTask(this);"
+            li_pattern = re.compile(r'<li[^>]*onclick="goTask\(this\);"[^>]*data="([^"]+)"[^>]*>(.*?)</li>', re.DOTALL)
+            for match in li_pattern.finditer(html):
+                url_task = match.group(1).strip()
+                li_content = match.group(2)
+                
+                title_m = re.search(r'class="overHidden2[^"]*"[^>]*>(.*?)</p>', li_content, re.DOTALL)
+                title = title_m.group(1).strip() if title_m else "未命名作业"
+                title = re.sub(r'<[^>]+>', '', title).strip()
+                
+                status_m = re.search(r'class="status[^"]*"[^>]*>(.*?)</p>', li_content, re.DOTALL)
+                status = status_m.group(1).strip() if status_m else "未知"
+                status = re.sub(r'<[^>]+>', '', status).strip()
+                
+                time_m = re.search(r'class="time[^"]*"[^>]*>(.*?)</div>', li_content, re.DOTALL)
+                deadline = "无截止时间"
+                if time_m:
+                    deadline = re.sub(r'<[^>]+>', '', time_m.group(1)).strip()
+                    deadline = re.sub(r'\s+', ' ', deadline).strip()
+
+                tasks.append({
+                    "course": course.get("title", ""),
+                    "course_id": course_id,
+                    "clazz_id": clazz_id,
+                    "cpi": cpi,
+                    "chapter": "独立作业",
+                    "knowledge_id": "",
+                    "workid": "",
+                    "type": "作业",
+                    "status": status,
+                    "deadline": deadline,
+                    "url": url_task,
+                    "name": title
+                })
+            return tasks
+        except Exception as e:
+            print(f"[错误] 获取课程 {course.get('title')} 的作业列表失败: {e}")
+            return []
+
     # ----- 章节/任务信息 -----
 
     def get_course_unfinished(self, course: dict) -> list:
