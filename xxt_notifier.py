@@ -279,6 +279,7 @@ def parse_courses_from_html(html: str) -> list:
             "teacher": teacher,
             "info": m_info.group(1) if m_info else "",
             "roleId": m_role.group(1) if m_role else "",
+            "is_ended": "课程已结束" in part or "已结束" in part
         })
 
     return courses
@@ -391,6 +392,33 @@ class XuexitongClient:
         self.session.headers.update(HEADERS)
         self._uid = ""
         self._fid = ""
+        self.tokens_cache_file = BASE_DIR / "tokens_cache.json"
+        self.tokens_cache = {}
+        self.load_tokens_cache()
+
+    def load_tokens_cache(self):
+        try:
+            if self.tokens_cache_file.exists():
+                with open(self.tokens_cache_file, "r", encoding="utf-8") as f:
+                    self.tokens_cache = json.load(f)
+        except Exception as e:
+            print(f"[缓存] 加载Token缓存失败: {e}")
+            self.tokens_cache = {}
+
+    def save_tokens_cache(self):
+        try:
+            with open(self.tokens_cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.tokens_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[缓存] 保存Token缓存失败: {e}")
+
+    def clear_tokens_cache(self):
+        self.tokens_cache = {}
+        if self.tokens_cache_file.exists():
+            try:
+                self.tokens_cache_file.unlink()
+            except Exception:
+                pass
 
     # ----- 登录 -----
 
@@ -423,6 +451,8 @@ class XuexitongClient:
             return False
 
         if result.get("status") == True:
+            # 清除 Token 缓存，以保证新登录会话重新获取最新 Token
+            self.clear_tokens_cache()
             # 保存 cookies 中的用户信息
             self._uid = resp.cookies.get("_uid", "")
             self._fid = resp.cookies.get("fid", "")
@@ -507,7 +537,8 @@ class XuexitongClient:
         try:
             resp = self.session.post(COURSE_LIST_URL, data=data, headers=headers, timeout=15)
             if resp.status_code == 200:
-                courses = parse_courses_from_html(resp.text)
+                html = resp.content.decode('utf-8', errors='ignore')
+                courses = parse_courses_from_html(html)
                 print(f"[课程] 获取到 {len(courses)} 门课程")
                 return courses
         except Exception as e:
@@ -517,16 +548,30 @@ class XuexitongClient:
     def get_course_tokens(self, course: dict) -> dict:
         """
         Fetch the course landing middle page to resolve enc, workEnc, examEnc, openc, and t.
+        Uses local cache to avoid rate-limiting and anti-spider triggers.
         """
-        course_id = course.get("courseId", "")
+        course_id = str(course.get("courseId", ""))
         clazz_id = course.get("clazzId", "")
         cpi = course.get("cpi", "")
         if not all([course_id, clazz_id, cpi]):
             return {}
 
+        # 1. 优先使用缓存
+        cached = self.tokens_cache.get(course_id)
+        if cached and all(cached.get(k) for k in ["openc", "workEnc", "examEnc", "enc", "t"]):
+            return cached
+
+        # 2. 缓存不存在或不完整，请求服务器获取
+        # 增加延迟以防止请求频率过高触发滑块验证
+        time.sleep(1.5)
         url = f"https://mooc1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ismooc2=1&v=2"
         try:
             resp = self.session.get(url, timeout=15)
+            # 检查是否被防爬虫拦截
+            if "antispiderShowVerify.ac" in resp.url or "antispider" in resp.text:
+                print(f"[警告] 课程 {course.get('title')} 获取Token被防爬虫拦截，可能需要等待或重新登录验证。")
+                return {}
+
             html = resp.text
             
             def extract_val(id_name):
@@ -535,13 +580,20 @@ class XuexitongClient:
                     m = re.search(r'name="' + re.escape(id_name) + r'"[^>]*value="([^"]*)"', html)
                 return m.group(1) if m else None
 
-            return {
+            tokens = {
                 "openc": extract_val("openc"),
                 "workEnc": extract_val("workEnc"),
                 "examEnc": extract_val("examEnc"),
                 "enc": extract_val("enc"),
                 "t": extract_val("t")
             }
+
+            if all(tokens.values()):
+                self.tokens_cache[course_id] = tokens
+                self.save_tokens_cache()
+                return tokens
+            else:
+                return {}
         except Exception as e:
             print(f"[错误] 获取课程 {course.get('title')} 的Token失败: {e}")
             return {}
@@ -565,6 +617,13 @@ class XuexitongClient:
             resp = self.session.get(url, timeout=15)
             # Homework page is UTF-8 encoded
             html = resp.content.decode('utf-8', errors='ignore')
+            
+            # 检查是否被防爬虫拦截
+            if "antispiderShowVerify.ac" in resp.url or "antispider" in html:
+                print(f"[警告] 课程 {course.get('title')} 获取作业列表被防爬虫拦截，清除Token缓存。")
+                self.tokens_cache.pop(str(course_id), None)
+                self.save_tokens_cache()
+                return []
             
             tasks = []
             # Find list items with onclick="goTask(this);"
@@ -624,8 +683,15 @@ class XuexitongClient:
         url = f"https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ut=s&t={t}&stuenc={enc}&enc={exam_enc}&openc={openc}"
         try:
             resp = self.session.get(url, timeout=15)
-            # Exam page is GB18030 encoded
-            html = resp.content.decode('gb18030', errors='ignore')
+            # Exam page is UTF-8 encoded
+            html = resp.content.decode('utf-8', errors='ignore')
+            
+            # 检查是否被防爬虫拦截
+            if "antispiderShowVerify.ac" in resp.url or "antispider" in html:
+                print(f"[警告] 课程 {course.get('title')} 获取考试列表被防爬虫拦截，清除Token缓存。")
+                self.tokens_cache.pop(str(course_id), None)
+                self.save_tokens_cache()
+                return []
             
             tasks = []
             li_pattern = re.compile(r'<li[^>]*>(.*?)</li>', re.DOTALL)
@@ -682,6 +748,8 @@ class XuexitongClient:
         Get course direct unfinished homework and exams.
         Returns: [(Task Name, 1), ...] (for status aggregation)
         """
+        if course.get("is_ended"):
+            return []
         tokens = self.get_course_tokens(course)
         if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
             return []
@@ -692,10 +760,10 @@ class XuexitongClient:
         unfinished = []
         for h in hws:
             if h["status"] in ["未交", "进行中", "待做"]:
-                unfinished.append((h["name"], 1))
+                unfinished.append((f"[作业] {h['name']}", 1))
         for e in exams:
             if e["status"] in ["未交", "进行中", "待做"]:
-                unfinished.append((e["name"], 1))
+                unfinished.append((f"[考试] {e['name']}", 1))
                 
         return unfinished
 
@@ -767,6 +835,10 @@ class XuexitongClient:
             scanned += 1
             title = course.get("title") or course.get("courseId", "未知课程")
             
+            # 跳过已结束的课程
+            if course.get("is_ended"):
+                continue
+
             # Fetch landing page tokens
             tokens = self.get_course_tokens(course)
             if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
@@ -788,7 +860,7 @@ class XuexitongClient:
             results.extend(unfinished_exams)
             
             # Avoid rate limits
-            time.sleep(0.5)
+            time.sleep(2.0)
             
         return results
 
@@ -951,6 +1023,11 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
         title = course.get("title", course.get("courseId", "未知课程"))
         course_key = course.get("courseId", "") or course.get("id", "")
 
+        if course.get("is_ended"):
+            brief = f"  {title}: ✅ 已结束(跳过)"
+            summary_lines.append(brief)
+            continue
+
         # 获取未完成的章节点
         unfinished = client.get_course_unfinished(course)
         total = sum(c for _, c in unfinished)
@@ -977,6 +1054,9 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
         # 汇总显示
         brief = f"  {title}: {'⚠️ {}项'.format(total) if total else '✅ 完成'}"
         summary_lines.append(brief)
+        
+        # 避免请求频率过高，每次课程检查后延迟
+        time.sleep(2.0)
 
     # 打印本轮课程摘要
     if summary_lines:
@@ -1102,8 +1182,8 @@ def run_list_tasks(output_file: Optional[Path] = None) -> Optional[list]:
 
     # 优先用 cookies
     if config.get("cookies") and client.load_cookies(config["cookies"]):
-        test_count = client.get_notice_count()
-        if test_count >= 0:
+        test_courses = client.get_course_list()
+        if test_courses:
             print("[登录] 使用已保存的会话（有效）")
         else:
             print("[登录] 会话已过期，尝试密码登录")
@@ -1180,8 +1260,8 @@ def main():
     if config.get("cookies"):
         if client.load_cookies(config["cookies"]):
             print("[登录] 尝试使用已保存的会话...")
-            test_count = client.get_notice_count()
-            if test_count >= 0:
+            test_courses = client.get_course_list()
+            if test_courses:
                 print("[登录] 会话有效，跳过密码登录")
             else:
                 print("[登录] 会话已过期")
