@@ -613,10 +613,10 @@ class XuexitongClient:
         course_id = course.get("courseId", "")
         clazz_id = course.get("clazzId", "")
         cpi = course.get("cpi", "")
-        exam_enc = tokens.get("examEnc")
-        openc = tokens.get("openc")
-        enc = tokens.get("enc")
-        t = tokens.get("t")
+        exam_enc = tokens.get("examEnc") or ""
+        openc = tokens.get("openc") or ""
+        enc = tokens.get("enc") or ""
+        t = tokens.get("t") or ""
 
         if not all([course_id, clazz_id, cpi, exam_enc, enc, t]):
             return []
@@ -628,7 +628,7 @@ class XuexitongClient:
             html = resp.content.decode('gb18030', errors='ignore')
             
             tasks = []
-            li_pattern = re.compile(r'<li>(.*?)</li>', re.DOTALL)
+            li_pattern = re.compile(r'<li[^>]*>(.*?)</li>', re.DOTALL)
             for match in li_pattern.finditer(html):
                 li_content = match.group(1)
                 if "goTest(" not in li_content:
@@ -648,7 +648,7 @@ class XuexitongClient:
                     deadline = re.sub(r'<[^>]+>', '', time_m.group(1)).strip()
                     deadline = re.sub(r'\s+', ' ', deadline).strip()
 
-                onclick_m = re.search(r'onclick="goTest\((.*?)\);"', li_content)
+                onclick_m = re.search(r'onclick\s*=\s*["\']goTest\((.*?)\);?["\']', li_content)
                 url_task = "未知URL"
                 if onclick_m:
                     args = [a.strip().strip("'").strip('"') for a in onclick_m.group(1).split(',')]
