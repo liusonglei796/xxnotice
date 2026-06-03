@@ -606,6 +606,75 @@ class XuexitongClient:
             print(f"[错误] 获取课程 {course.get('title')} 的作业列表失败: {e}")
             return []
 
+    def _get_exam_list(self, course: dict, tokens: dict) -> list:
+        """
+        Fetch the exam page, decode as GB18030, and parse list items.
+        """
+        course_id = course.get("courseId", "")
+        clazz_id = course.get("clazzId", "")
+        cpi = course.get("cpi", "")
+        exam_enc = tokens.get("examEnc")
+        openc = tokens.get("openc")
+        enc = tokens.get("enc")
+        t = tokens.get("t")
+
+        if not all([course_id, clazz_id, cpi, exam_enc, enc, t]):
+            return []
+
+        url = f"https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ut=s&t={t}&stuenc={enc}&enc={exam_enc}&openc={openc}"
+        try:
+            resp = self.session.get(url, timeout=15)
+            # Exam page is GB18030 encoded
+            html = resp.content.decode('gb18030', errors='ignore')
+            
+            tasks = []
+            li_pattern = re.compile(r'<li>(.*?)</li>', re.DOTALL)
+            for match in li_pattern.finditer(html):
+                li_content = match.group(1)
+                if "goTest(" not in li_content:
+                    continue
+                
+                title_m = re.search(r'class="overHidden2[^"]*"[^>]*>(.*?)</p>', li_content, re.DOTALL)
+                title = title_m.group(1).strip() if title_m else "未命名考试"
+                title = re.sub(r'<[^>]+>', '', title).strip()
+                
+                status_m = re.search(r'class="status[^"]*"[^>]*>(.*?)</p>', li_content, re.DOTALL)
+                status = status_m.group(1).strip() if status_m else "未知"
+                status = re.sub(r'<[^>]+>', '', status).strip()
+                
+                time_m = re.search(r'class="time[^"]*"[^>]*>(.*?)</div>', li_content, re.DOTALL)
+                deadline = "无截止时间"
+                if time_m:
+                    deadline = re.sub(r'<[^>]+>', '', time_m.group(1)).strip()
+                    deadline = re.sub(r'\s+', ' ', deadline).strip()
+
+                onclick_m = re.search(r'onclick="goTest\((.*?)\);"', li_content)
+                url_task = "未知URL"
+                if onclick_m:
+                    args = [a.strip().strip("'").strip('"') for a in onclick_m.group(1).split(',')]
+                    if len(args) >= 2:
+                        exam_id = args[1]
+                        url_task = f"https://mooc1.chaoxing.com/exam-ans/exam/test/examcode/examnotes?courseId={course_id}&classId={clazz_id}&examId={exam_id}&cpi={cpi}"
+
+                tasks.append({
+                    "course": course.get("title", ""),
+                    "course_id": course_id,
+                    "clazz_id": clazz_id,
+                    "cpi": cpi,
+                    "chapter": "独立考试",
+                    "knowledge_id": "",
+                    "workid": "",
+                    "type": "考试",
+                    "status": status,
+                    "deadline": deadline,
+                    "url": url_task,
+                    "name": title
+                })
+            return tasks
+        except Exception as e:
+            print(f"[错误] 获取课程 {course.get('title')} 的考试列表失败: {e}")
+            return []
+
     # ----- 章节/任务信息 -----
 
     def get_course_unfinished(self, course: dict) -> list:
