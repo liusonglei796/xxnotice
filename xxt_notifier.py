@@ -1024,36 +1024,36 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
         course_key = course.get("courseId", "") or course.get("id", "")
 
         if course.get("is_ended"):
-            brief = f"  {title}: ✅ 已结束(跳过)"
-            summary_lines.append(brief)
             continue
 
-        # 获取未完成的章节点
+        # 获取未完成的任务列表
         unfinished = client.get_course_unfinished(course)
         total = sum(c for _, c in unfinished)
 
-        if total > 0:
-            # 计算当前课程的 hash 值，用于判断是否有变化
-            current_hash = hash(str(sorted(unfinished)))
-            last_hash = seen.get(course_key, 0)
+        # 没有未完成的任务，直接跳过不显示
+        if total == 0:
+            continue
 
-            if current_hash != last_hash and need_deep_check:
-                # 有新的未完成任务！
-                items = [f"  • {ptitle}({cnt}项)" for ptitle, cnt in unfinished[:3]]
-                detail = "\n".join(items)
-                if len(unfinished) > 3:
-                    detail += f"\n  ...还有 {len(unfinished) - 3} 个章节"
+        # 检查是否需要弹窗通知
+        current_hash = hash(str(sorted(unfinished)))
+        last_hash = seen.get(course_key, 0)
+        if current_hash != last_hash and need_deep_check:
+            items = [f"  • {ptitle}" for ptitle, _ in unfinished[:3]]
+            detail = "\n".join(items)
+            if len(unfinished) > 3:
+                detail += f"\n  ...还有 {len(unfinished) - 3} 个任务"
 
-                msg = f"课程：{title}\n共有 {total} 个未完成任务\n\n{detail}"
-                print(f"[新任务] {title}: {total} 个未完成")
-                show_notification("📚 学习通 - 有新的作业/任务", msg)
+            msg = f"课程：{title}\n共有 {total} 个未完成任务\n\n{detail}"
+            print(f"[新任务] {title}: {total} 个未完成")
+            show_notification("📚 学习通 - 有新的作业/任务", msg)
 
-            # 更新 state
-            seen[course_key] = current_hash
+        # 更新 state
+        seen[course_key] = current_hash
 
-        # 汇总显示
-        brief = f"  {title}: {'⚠️ {}项'.format(total) if total else '✅ 完成'}"
-        summary_lines.append(brief)
+        # 汇总显示：添加课程标题和每一个任务的名字
+        summary_lines.append(f"  {title}: ⚠️ {total}项")
+        for ptitle, _ in unfinished:
+            summary_lines.append(f"    - {ptitle}")
         
         # 避免请求频率过高，每次课程检查后延迟
         time.sleep(2.0)
