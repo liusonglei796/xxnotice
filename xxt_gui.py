@@ -62,9 +62,83 @@ class LoginFrame(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent, bg=THEME["bg"])
         self.controller = controller
-        # Temp placeholder label
-        lbl = tk.Label(self, text="登录页面", bg=THEME["bg"], fg=THEME["fg"], font=("Microsoft YaHei", 20))
-        lbl.pack(pady=50)
+        
+        # Center panel card
+        card = tk.Frame(self, bg=THEME["card_bg"], padx=40, pady=40)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # Title
+        title = tk.Label(card, text="学习通账户登录", bg=THEME["card_bg"], fg=THEME["fg"], font=("Microsoft YaHei", 20, "bold"))
+        title.pack(pady=(0, 30))
+        
+        # Phone
+        lbl_phone = tk.Label(card, text="手机号", bg=THEME["card_bg"], fg=THEME["fg_dim"], font=("Microsoft YaHei", 10))
+        lbl_phone.pack(anchor="w", pady=(0, 5))
+        self.ent_phone = tk.Entry(card, bg=THEME["input_bg"], fg=THEME["fg"], insertbackground=THEME["fg"],
+                                  font=("Microsoft YaHei", 12), bd=0, relief="flat", width=30)
+        self.ent_phone.pack(pady=(0, 20), ipady=8)
+        
+        # Autofill phone from config
+        saved_phone = self.controller.config.get("phone", "")
+        if saved_phone:
+            self.ent_phone.insert(0, saved_phone)
+            
+        # Password
+        lbl_pwd = tk.Label(card, text="密码", bg=THEME["card_bg"], fg=THEME["fg_dim"], font=("Microsoft YaHei", 10))
+        lbl_pwd.pack(anchor="w", pady=(0, 5))
+        self.ent_pwd = tk.Entry(card, bg=THEME["input_bg"], fg=THEME["fg"], insertbackground=THEME["fg"],
+                                font=("Microsoft YaHei", 12), show="*", bd=0, relief="flat", width=30)
+        self.ent_pwd.pack(pady=(0, 10), ipady=8)
+        
+        saved_pwd = self.controller.config.get("password", "")
+        if saved_pwd:
+            self.ent_pwd.insert(0, saved_pwd)
+
+        # Status text
+        self.lbl_status = tk.Label(card, text="", bg=THEME["card_bg"], fg=THEME["error"], font=("Microsoft YaHei", 10))
+        self.lbl_status.pack(pady=(0, 20))
+        
+        # Login Button
+        self.btn_login = tk.Button(card, text="登  录", bg=THEME["accent"], fg=THEME["fg"], 
+                                   activebackground=THEME["accent_hover"], activeforeground=THEME["fg"],
+                                   font=("Microsoft YaHei", 12, "bold"), bd=0, relief="flat", width=28,
+                                   command=self.perform_login)
+        self.btn_login.pack(ipady=8)
+        
+        # Hover effect on button
+        self.btn_login.bind("<Enter>", lambda e: self.btn_login.configure(bg=THEME["accent_hover"]))
+        self.btn_login.bind("<Leave>", lambda e: self.btn_login.configure(bg=THEME["accent"]))
+
+    def perform_login(self):
+        phone = self.ent_phone.get().strip()
+        pwd = self.ent_pwd.get().strip()
+        
+        if not phone or not pwd:
+            self.lbl_status.configure(text="手机号或密码不能为空", fg=THEME["error"])
+            return
+            
+        self.lbl_status.configure(text="正在登录...", fg=THEME["fg_dim"])
+        self.btn_login.configure(state="disabled")
+        self.update_idletasks()
+        
+        try:
+            success = self.controller.client.login(phone, pwd)
+            if success:
+                # Save credentials and new cookies
+                self.controller.config["phone"] = phone
+                self.controller.config["password"] = pwd
+                self.controller.config["cookies"] = self.controller.client.get_cookies()
+                save_config(self.controller.config)
+                
+                self.lbl_status.configure(text="登录成功！正在跳转...", fg=THEME["success"])
+                self.update_idletasks()
+                self.after(500, lambda: self.controller.show_frame(DashboardFrame))
+            else:
+                self.lbl_status.configure(text="登录失败，请检查账号密码", fg=THEME["error"])
+                self.btn_login.configure(state="normal")
+        except Exception as e:
+            self.lbl_status.configure(text=f"异常: {e}", fg=THEME["error"])
+            self.btn_login.configure(state="normal")
 
 class DashboardFrame(tk.Frame):
     def __init__(self, parent, controller):
