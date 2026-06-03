@@ -701,60 +701,6 @@ class XuexitongClient:
 
     # ----- 章节卡片（未完成任务清单）-----
 
-    def get_course_unfinished_chapters(self, course: dict) -> list:
-        """
-        获取课程中所有有未完成任务的章节（含 knowledge_id）
-        解析 studentcourse 页面，提取 chapter_item 块
-        返回: [{"knowledge_id": str, "title": str, "unfinished": int, "cpi": str}, ...]
-        只返回 unfinished > 0 的章节
-        """
-        course_id = course.get("courseId", "")
-        clazz_id = course.get("clazzId", "")
-        cpi = course.get("cpi", "")
-        if not all([course_id, clazz_id, cpi]):
-            return []
-        url = f"{COURSE_DETAIL_URL}?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ut=s"
-        try:
-            resp = self.session.get(url, timeout=15)
-            if resp.status_code != 200:
-                return []
-        except Exception as e:
-            print(f"[章节] {course.get('title', course_id)} 查询失败: {e}")
-            return []
-
-        html = resp.text
-        # 匹配 chapter_item 块（非贪婪，到下一个 chapter_item 或 </div></li>）
-        chapter_pattern = re.compile(
-            r'<div\s+class="chapter_item"\s+id="(cur\d+)"[^>]*>(.*?)(?=<div\s+class="chapter_item"|</div>\s*</li>)',
-            re.DOTALL,
-        )
-        results = []
-        for m in chapter_pattern.finditer(html):
-            knowledge_id = m.group(1)[3:]  # 去 "cur"
-            block = m.group(2)
-            # 标题：<span class="catalog_sbar">X.Y</span> 名称
-            title_m = re.search(
-                r'<span\s+class="catalog_sbar">([^<]*)</span>\s*([^<]*)',
-                block,
-            )
-            if title_m:
-                full_title = f"{title_m.group(1).strip()} {title_m.group(2).strip()}".strip()
-            else:
-                full_title = knowledge_id
-            # knowledgeJobCount
-            cnt_m = re.search(
-                r'<input\s+type="hidden"\s+value="(\d+)"\s+class="knowledgeJobCount"',
-                block,
-            )
-            unfinished = int(cnt_m.group(1)) if cnt_m else 0
-            if unfinished > 0:
-                results.append({
-                    "knowledge_id": knowledge_id,
-                    "title": full_title,
-                    "unfinished": unfinished,
-                    "cpi": cpi,
-                })
-        return results
 
     def get_chapter_attachments(self, course_id: str, clazz_id: str, knowledge_id: str) -> list:
         """
