@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build
+build/
+dist/
+*.spec
+
+# Config & secrets
+config.json
+tokens_cache.json
+state.json
+unfinished_tasks.json
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Playwright MCP
+.playwright-mcp/

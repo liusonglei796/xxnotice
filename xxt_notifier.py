@@ -1,19 +1,22 @@
 """
-学习通作业/考试桌面通知小工具
-============================
-功能：定时检测学习通课程中的未完成作业/任务，有新任务时弹出 Windows 桌面通知
-原理：基于逆向的学习通 API（mooc1/mooc2 系列接口），登录后定期轮询课程任务状态
+学习通作业/考试桌面通知小工具（GUI 版）
+=====================================
+功能：扫码学习通课程中的未完成作业/考试任务，GUI 界面展示
+原理：基于逆向的学习通 API（mooc1/mooc2 系列接口）
 
-依赖：requests, pycryptodome, plyer
-用法：python xxt_notifier.py
+依赖：requests, pycryptodome（内置：tkinter）
+用法：python -m xxt_gui  或  start.bat
 """
 
 from pathlib import Path
 import json
 import time
-import hashlib
 import re
 import sys
+import logging
+import threading
+import winreg  # Windows 注册表操作（用于开机自启管理）
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Optional
@@ -22,15 +25,27 @@ import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import base64
-from plyer import notification
 
 
 # ============================================================
 # 配置区
 # ============================================================
 
-# 轮询间隔（秒）
+# 默认轮询间隔（秒），可由 config.json 的 poll_interval 覆盖
 POLL_INTERVAL = 300  # 5 分钟
+
+# 默认配置模板
+DEFAULT_CONFIG = {
+    "phone": "",                    # 手机号
+    "password": "",                 # 密码
+    "cookies": [],                  # 已保存的 cookies 会话
+    "poll_interval": 300,           # 轮询间隔（秒）
+    "only_courses": [],             # 课程白名单：空列表=监控所有课程；非空=只监控指定课程名称
+    "max_workers": 8,               # 并发扫描线程数
+    "rate_limit_delay": 1.0,        # 单课程请求间隔（秒）
+    "token_cooldown": 60,        # Token 触发反爬虫后的冷却时间（秒）
+    "hide_no_deadline": False,      # 是否隐藏无截止时间的任务（部分课程仅列表不显示截止时间）
+}
 
 # API 端点
 LOGIN_URL = "https://passport2.chaoxing.com/fanyalogin"
@@ -51,7 +66,45 @@ AES_KEY = "u2oh6Vu^HWe4_AES"
 # 文件路径
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
-STATE_FILE = BASE_DIR / "state.json"
+
+# ============================================================
+# 日志系统
+# ============================================================
+
+# 全局日志记录器
+LOG_FILE = BASE_DIR / "xxt_notifier.log"
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    """
+    配置日志系统：同时输出到控制台和文件 xxt_notifier.log
+    被 main() 和 GUI 入口调用，全局只需初始化一次
+    """
+    logger = logging.getLogger("xxt")
+    # 避免重复添加 handler
+    if logger.handlers:
+        return logger
+    logger.setLevel(level)
+
+    # 文件处理器（UTF-8，保留详细日志）
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(fh)
+
+    # 控制台处理器（简单格式，无时间戳）
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(ch)
+
+    return logger
+
+
+logger = setup_logging()
+
 
 # HTTP 请求头
 HEADERS = {
@@ -393,33 +446,168 @@ class XuexitongClient:
         self.session.headers.update(HEADERS)
         self._uid = ""
         self._fid = ""
+        self._cache_uid = None
         self.tokens_cache_file = BASE_DIR / "tokens_cache.json"
         self.tokens_cache = {}
+        # 线程本地存储：每个线程持有一个独立的 session 副本
+        self._thread_local = threading.local()
+        # 保护 tokens_cache 并发写入的锁
+        self._cache_lock = threading.Lock()
         self.load_tokens_cache()
+
+    def _get_session(self) -> requests.Session:
+        """
+        获取当前线程的 session 副本（懒加载）。
+        并发优化：每个线程持有独立 session，避免共享 session 的 cookie 竞争条件。
+        不做此优化的后果：多个线程同时使用同一 session 并发请求时，
+        cookie jar 的读写可能产生竞争，导致请求使用错误的 cookie 或丢失 set-cookie。
+        """
+        if not hasattr(self._thread_local, 'session'):
+            sess = requests.Session()
+            # 从主 session 复制 cookie 到线程 session
+            for cookie in self.session.cookies:
+                sess.cookies.set(
+                    cookie.name, cookie.value,
+                    domain=cookie.domain,
+                    path=cookie.path,
+                )
+            for k, v in self.session.headers.items():
+                sess.headers[k] = v
+            self._thread_local.session = sess
+        return self._thread_local.session
 
     def load_tokens_cache(self):
         try:
             if self.tokens_cache_file.exists():
                 with open(self.tokens_cache_file, "r", encoding="utf-8") as f:
-                    self.tokens_cache = json.load(f)
+                    data = json.load(f)
+                    if isinstance(data, dict) and "uid" in data and "tokens" in data:
+                        self._cache_uid = data.get("uid")
+                        self.tokens_cache = data.get("tokens", {})
+                    else:
+                        self._cache_uid = None
+                        self.tokens_cache = data if isinstance(data, dict) else {}
         except Exception as e:
-            print(f"[缓存] 加载Token缓存失败: {e}")
+            logger.warning(f"加载Token缓存失败: {e}")
             self.tokens_cache = {}
+            self._cache_uid = None
 
     def save_tokens_cache(self):
         try:
+            data = {
+                "uid": self._uid,
+                "tokens": self.tokens_cache
+            }
             with open(self.tokens_cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.tokens_cache, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"[缓存] 保存Token缓存失败: {e}")
+            logger.warning(f"保存Token缓存失败: {e}")
 
     def clear_tokens_cache(self):
         self.tokens_cache = {}
+        self._cache_uid = None
         if self.tokens_cache_file.exists():
             try:
                 self.tokens_cache_file.unlink()
             except Exception:
                 pass
+
+    def clear_cooldowns(self):
+        """
+        清除所有课程的冷却标记，保留有效的 token 缓存。
+        被 GUI 手动刷新时调用，允许用户强制重新请求被反爬拦截的课程。
+        不做此操作的后果：被反爬的课程会持续 1800 秒冷却期，期间手动刷新也无法获取数据。
+        """
+        with self._cache_lock:
+            changed = False
+            for course_id in list(self.tokens_cache.keys()):
+                entry = self.tokens_cache.get(course_id, {})
+                if "cooldown_until" in entry:
+                    del self.tokens_cache[course_id]
+                    changed = True
+                    logger.info(f"清除课程 {course_id} 的冷却标记")
+            if changed:
+                self.save_tokens_cache()
+
+    # ----- 二维码登录 -----
+
+    def get_qr_code_params(self) -> tuple[Optional[str], Optional[str], Optional[bytes]]:
+        """
+        获取二维码登录参数及图片数据
+        返回: (uuid, enc, qr_image_bytes)
+        """
+        url = 'https://passport2.chaoxing.com/login?fid=-1&newversion=true&refer=http://i.chaoxing.com'
+        try:
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.error(f"获取登录页面失败，状态码: {resp.status_code}")
+                return None, None, None
+
+            def extract_field(html, field_id):
+                # Pattern 1: value="..." id="field_id"
+                m1 = re.search(r'value="([^"]+)"\s+id="' + field_id + r'"', html)
+                if m1:
+                    return m1.group(1)
+                # Pattern 2: id="field_id" value="..."
+                m2 = re.search(r'id="' + field_id + r'"\s+value="([^"]+)"', html)
+                if m2:
+                    return m2.group(1)
+                # Pattern 3: general tag search
+                m3 = re.search(r'<input[^>]+?id="' + field_id + r'"[^>]*?>', html)
+                if m3:
+                    val = re.search(r'value="([^"]+)"', m3.group(0))
+                    if val:
+                        return val.group(1)
+                return None
+
+            uuid = extract_field(resp.text, 'uuid')
+            enc = extract_field(resp.text, 'enc')
+
+            if not uuid or not enc:
+                logger.error("解析 uuid 或 enc 失败")
+                return None, None, None
+
+            # 请求二维码图片，激活该 session 对应的二维码
+            qr_url = f"https://passport2.chaoxing.com/createqr?uuid={uuid}&fid=-1"
+            qr_resp = self.session.get(qr_url, timeout=10)
+            if qr_resp.status_code != 200:
+                logger.error(f"下载二维码图片失败，状态码: {qr_resp.status_code}")
+                return None, None, None
+
+            return uuid, enc, qr_resp.content
+        except Exception as e:
+            logger.error(f"获取二维码参数出错: {e}")
+            return None, None, None
+
+    def check_qr_login_status(self, uuid: str, enc: str) -> dict:
+        """
+        轮询检测二维码扫码状态
+        返回: json 字典 (含有 status, mes, type 等字段)
+        """
+        poll_url = 'https://passport2.chaoxing.com/getauthstatus'
+        data = {
+            'uuid': uuid,
+            'enc': enc
+        }
+        try:
+            resp = self.session.post(poll_url, data=data, timeout=10)
+            if resp.status_code != 200:
+                return {"status": False, "mes": "网络错误", "type": "99"}
+            
+            result = resp.json()
+            if result.get("status") == True:
+                # 登录成功，保存相关状态
+                new_uid = self.session.cookies.get("_uid", "")
+                if self._cache_uid and new_uid != self._cache_uid:
+                    logger.info(f"检测到登录账户变更 (旧UID: {self._cache_uid} -> 新UID: {new_uid})，清除旧 Token 缓存")
+                    self.clear_tokens_cache()
+                self._uid = new_uid
+                self._fid = self.session.cookies.get("fid", "")
+                logger.info(f"扫码登录成功，UID={self._uid}")
+            return result
+        except Exception as e:
+            logger.error(f"检测二维码状态出错: {e}")
+            return {"status": False, "mes": f"出错: {e}", "type": "99"}
 
     # ----- 登录 -----
 
@@ -442,26 +630,27 @@ class XuexitongClient:
         }
         resp = self.session.post(LOGIN_URL, data=data)
         if resp.status_code != 200:
-            print(f"[错误] 登录请求失败，状态码: {resp.status_code}")
+            logger.error(f"登录请求失败，状态码: {resp.status_code}")
             return False
 
         try:
             result = resp.json()
         except json.JSONDecodeError:
-            print(f"[错误] 登录响应不是有效的 JSON: {resp.text[:200]}")
+            logger.error(f"登录响应不是有效的 JSON: {resp.text[:200]}")
             return False
 
         if result.get("status") == True:
-            # 清除 Token 缓存，以保证新登录会话重新获取最新 Token
-            self.clear_tokens_cache()
-            # 保存 cookies 中的用户信息
-            self._uid = resp.cookies.get("_uid", "")
+            new_uid = resp.cookies.get("_uid", "")
+            if self._cache_uid and new_uid != self._cache_uid:
+                logger.info(f"检测到登录账户变更 (旧UID: {self._cache_uid} -> 新UID: {new_uid})，清除旧 Token 缓存")
+                self.clear_tokens_cache()
+            self._uid = new_uid
             self._fid = resp.cookies.get("fid", "")
-            print(f"[登录] 成功，UID={self._uid}")
+            logger.info(f"登录成功，UID={self._uid}")
             return True
         else:
             msg = result.get("msg2", result.get("msg", "未知错误"))
-            print(f"[登录] 失败: {msg}")
+            logger.warning(f"登录失败: {msg}")
             return False
 
     def load_cookies(self, cookie_list: list) -> bool:
@@ -514,7 +703,7 @@ class XuexitongClient:
                     return int(data.get("count", 0))
                 return 0
         except Exception as e:
-            print(f"[通知数] 请求失败: {e}")
+            logger.warning(f"通知数请求失败: {e}")
         return -1
 
     # ----- 课程列表 -----
@@ -540,40 +729,65 @@ class XuexitongClient:
             if resp.status_code == 200:
                 html = resp.content.decode('utf-8', errors='ignore')
                 courses = parse_courses_from_html(html)
-                print(f"[课程] 获取到 {len(courses)} 门课程")
+                logger.info(f"获取到 {len(courses)} 门课程")
                 return courses
         except Exception as e:
-            print(f"[课程] 请求失败: {e}")
+            logger.warning(f"课程列表请求失败: {e}")
         return []
 
-    def get_course_tokens(self, course: dict) -> dict:
+    def _set_course_cooldown(self, course_id: str, cooldown_sec: int = 60):
         """
-        Fetch the course landing middle page to resolve enc, workEnc, examEnc, openc, and t.
-        Uses local cache to avoid rate-limiting and anti-spider triggers.
+        设置课程冷却时间（线程安全）。
+        被 get_course_tokens、_get_homework_list、_get_exam_list 在检测到反爬虫时调用。
         """
-        course_id = str(course.get("courseId", ""))
+        now = time.time()
+        with self._cache_lock:
+            self.tokens_cache[str(course_id)] = {"cooldown_until": now + cooldown_sec}
+            self.save_tokens_cache()
+
+    def get_course_tokens(self, course: dict, cooldown_sec: int = 60) -> dict:
+        course_id = course.get("courseId", "") or course.get("id", "")
         clazz_id = course.get("clazzId", "")
         cpi = course.get("cpi", "")
+
         if not all([course_id, clazz_id, cpi]):
+            logger.warning(f"课程 {course.get('title')} 缺少参数: courseId={course_id!r} clazzId={clazz_id!r} cpi={cpi!r}")
             return {}
 
-        # 1. 优先使用缓存
-        cached = self.tokens_cache.get(course_id)
-        if cached and all(cached.get(k) for k in ["openc", "workEnc", "examEnc", "enc", "t"]):
+        now = time.time()
+        # 带锁读取缓存，避免与 save_tokens_cache 的数据竞争
+        with self._cache_lock:
+            cached = self.tokens_cache.get(course_id, {})
+
+        # 1. 检查冷却期：如果之前被反爬虫拦截且冷却未结束，直接跳过
+        cooldown_until = cached.get("cooldown_until", 0)
+        if cooldown_until > now:
+            logger.debug(f"课程 {course.get('title')} 在冷却中（剩余{int(cooldown_until - now)}秒），跳过")
+            return {}
+
+        # 2. 缓存命中（且不在冷却期）
+        if all(cached.get(k) for k in ["openc", "workEnc", "examEnc", "enc", "t"]):
+            logger.debug(f"课程 {course.get('title')} 使用缓存token")
             return cached
 
-        # 2. 缓存不存在或不完整，请求服务器获取
-        # 增加延迟以防止请求频率过高触发滑块验证
-        time.sleep(1.5)
+        logger.debug(f"课程 {course.get('title')} 缓存不完整或不存在，准备请求 (cache_keys={list(cached.keys())})")
+
+        # 3. 缓存不存在或不完整，请求服务器获取
+        # 请求前延迟：测试证实 0.3s 间隔跨课程安全（反爬受总次数限制，不受频率限制）
+        time.sleep(0.3)
+        sess = self._get_session()  # 线程安全 session
         url = f"https://mooc1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ismooc2=1&v=2"
         try:
-            resp = self.session.get(url, timeout=15)
-            # 检查是否被防爬虫拦截
+            resp = sess.get(url, timeout=15)
+
+            # 检查是否被防爬虫拦截 → 设置冷却期
             if "antispiderShowVerify.ac" in resp.url or "antispider" in resp.text:
-                print(f"[警告] 课程 {course.get('title')} 获取Token被防爬虫拦截，可能需要等待或重新登录验证。")
+                logger.warning(f"课程 {course.get('title')} 获取Token被防爬虫拦截，冷却{cooldown_sec}秒")
+                self._set_course_cooldown(course_id, cooldown_sec)
                 return {}
 
-            html = resp.text
+            # 使用 content.decode('utf-8') 而非 resp.text，防止响应编码检测错误导致乱码
+            html = resp.content.decode('utf-8', errors='ignore')
             
             def extract_val(id_name):
                 m = re.search(r'id="' + re.escape(id_name) + r'"[^>]*value="([^"]*)"', html)
@@ -586,17 +800,20 @@ class XuexitongClient:
                 "workEnc": extract_val("workEnc"),
                 "examEnc": extract_val("examEnc"),
                 "enc": extract_val("enc"),
-                "t": extract_val("t")
+                "t": extract_val("t"),
             }
 
             if all(tokens.values()):
-                self.tokens_cache[course_id] = tokens
-                self.save_tokens_cache()
+                with self._cache_lock:
+                    self.tokens_cache[course_id] = tokens
+                    self.save_tokens_cache()
                 return tokens
             else:
+                missing = [k for k, v in tokens.items() if not v]
+                logger.warning(f"课程 {course.get('title')} Token提取不完整，缺少: {missing}")
                 return {}
         except Exception as e:
-            print(f"[错误] 获取课程 {course.get('title')} 的Token失败: {e}")
+            logger.error(f"获取课程 {course.get('title')} 的Token失败: {e}")
             return {}
 
     def _get_homework_list(self, course: dict, tokens: dict) -> list:
@@ -615,15 +832,15 @@ class XuexitongClient:
 
         url = f"https://mooc1.chaoxing.com/mooc2/work/list?courseId={course_id}&classId={clazz_id}&cpi={cpi}&ut=s&t={t}&stuenc={enc}&enc={work_enc}"
         try:
-            resp = self.session.get(url, timeout=15)
+            sess = self._get_session()  # 线程安全 session
+            resp = sess.get(url, timeout=15)
             # Homework page is UTF-8 encoded
             html = resp.content.decode('utf-8', errors='ignore')
             
-            # 检查是否被防爬虫拦截
+            # 检查是否被防爬虫拦截 → 设置冷却期，避免下一轮重复请求
             if "antispiderShowVerify.ac" in resp.url or "antispider" in html:
-                print(f"[警告] 课程 {course.get('title')} 获取作业列表被防爬虫拦截，清除Token缓存。")
-                self.tokens_cache.pop(str(course_id), None)
-                self.save_tokens_cache()
+                logger.warning(f"课程 {course.get('title')} 获取作业列表被防爬虫拦截，设置冷却")
+                self._set_course_cooldown(course_id)
                 return []
             
             tasks = []
@@ -649,6 +866,7 @@ class XuexitongClient:
 
                 tasks.append({
                     "course": course.get("title", ""),
+                    "teacher": course.get("teacher", ""),
                     "course_id": course_id,
                     "clazz_id": clazz_id,
                     "cpi": cpi,
@@ -663,7 +881,7 @@ class XuexitongClient:
                 })
             return tasks
         except Exception as e:
-            print(f"[错误] 获取课程 {course.get('title')} 的作业列表失败: {e}")
+            logger.error(f"获取课程 {course.get('title')} 的作业列表失败: {e}")
             return []
 
     def _get_exam_list(self, course: dict, tokens: dict) -> list:
@@ -683,15 +901,15 @@ class XuexitongClient:
 
         url = f"https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ut=s&t={t}&stuenc={enc}&enc={exam_enc}&openc={openc}"
         try:
-            resp = self.session.get(url, timeout=15)
+            sess = self._get_session()  # 线程安全 session
+            resp = sess.get(url, timeout=15)
             # Exam page is UTF-8 encoded
             html = resp.content.decode('utf-8', errors='ignore')
             
-            # 检查是否被防爬虫拦截
+            # 检查是否被防爬虫拦截 → 设置冷却期
             if "antispiderShowVerify.ac" in resp.url or "antispider" in html:
-                print(f"[警告] 课程 {course.get('title')} 获取考试列表被防爬虫拦截，清除Token缓存。")
-                self.tokens_cache.pop(str(course_id), None)
-                self.save_tokens_cache()
+                logger.warning(f"课程 {course.get('title')} 获取考试列表被防爬虫拦截，设置冷却")
+                self._set_course_cooldown(course_id)
                 return []
             
             tasks = []
@@ -725,6 +943,7 @@ class XuexitongClient:
 
                 tasks.append({
                     "course": course.get("title", ""),
+                    "teacher": course.get("teacher", ""),
                     "course_id": course_id,
                     "clazz_id": clazz_id,
                     "cpi": cpi,
@@ -739,34 +958,10 @@ class XuexitongClient:
                 })
             return tasks
         except Exception as e:
-            print(f"[错误] 获取课程 {course.get('title')} 的考试列表失败: {e}")
+            logger.error(f"获取课程 {course.get('title')} 的考试列表失败: {e}")
             return []
 
     # ----- 章节/任务信息 -----
-
-    def get_course_unfinished(self, course: dict) -> list:
-        """
-        Get course direct unfinished homework and exams.
-        Returns: [(Task Name, 1), ...] (for status aggregation)
-        """
-        if course.get("is_ended"):
-            return []
-        tokens = self.get_course_tokens(course)
-        if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
-            return []
-
-        hws = self._get_homework_list(course, tokens)
-        exams = self._get_exam_list(course, tokens)
-        
-        unfinished = []
-        for h in hws:
-            if h["status"] in ["未交", "进行中", "待做"]:
-                unfinished.append((f"[作业] {h['name']}", 1))
-        for e in exams:
-            if e["status"] in ["未交", "进行中", "待做"]:
-                unfinished.append((f"[考试] {e['name']}", 1))
-                
-        return unfinished
 
     # ----- 章节卡片（未完成任务清单）-----
 
@@ -790,7 +985,7 @@ class XuexitongClient:
             try:
                 resp = self.session.get(url, headers=headers, timeout=15)
             except Exception as e:
-                print(f"[卡片] knowledgeid={knowledge_id} 请求失败: {e}")
+                logger.warning(f"[卡片] knowledgeid={knowledge_id} 请求失败: {e}")
                 return []
             # 200 = 正常含数据；202 = 服务器限流/异步占位（无 mArg），需重试
             if resp.status_code == 202 or '"attachments":[' not in resp.text:
@@ -799,7 +994,7 @@ class XuexitongClient:
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
-                print(f"[卡片] knowledgeid={knowledge_id} 状态码={resp.status_code}")
+                logger.warning(f"[卡片] knowledgeid={knowledge_id} 状态码={resp.status_code}")
                 return []
             return _parse_attachments_from_cards_html(resp.text)
         return []
@@ -822,48 +1017,141 @@ class XuexitongClient:
             return "作业"
         return "未知"
 
-    def get_unfinished_tasks(self, courses: Optional[list] = None) -> list:
+    def get_unfinished_tasks(self, courses: Optional[list] = None, config: Optional[dict] = None) -> list:
         """
-        Get independent unfinished homework and exams directly from course tabs.
+        两阶段扫描所有课程，返回未完成作业/考试的任务列表
+
+        阶段 1（串行）: 逐个获取课程的 Token，避免并发 Token 请求触发反爬。
+                       Token 已经缓存的课程瞬间完成，只有未缓存的课程需要实际 HTTP 请求。
+        阶段 2（并发）: 用 ThreadPoolExecutor 并行抓取每门课程的作业/考试列表。
+
+        被 list_unfinished_tasks()、GUI 调用
+
+        参数:
+            courses: 课程列表，None 时自动获取
+            config: 配置字典（max_workers、only_courses、rate_limit_delay）
         """
         if courses is None:
             courses = self.get_course_list()
-        results = []
-        total_courses = len(courses)
-        scanned = 0
-        
+
+        cfg = config or {}
+        max_workers = cfg.get("max_workers", 8)
+        rate_limit_delay = cfg.get("rate_limit_delay", 1.0)
+        only_courses = cfg.get("only_courses", [])
+
+        # 过滤：跳过已结束的课程 + 白名单过滤
+        filtered = []
         for course in courses:
-            scanned += 1
-            title = course.get("title") or course.get("courseId", "未知课程")
-            
-            # 跳过已结束的课程
             if course.get("is_ended"):
                 continue
+            title = course.get("title") or course.get("courseId", "未知课程")
+            if only_courses:
+                match = any(kw.lower() in title.lower() for kw in only_courses)
+                if not match:
+                    continue
+            filtered.append(course)
 
-            # Fetch landing page tokens
-            tokens = self.get_course_tokens(course)
-            if not tokens or not tokens.get("workEnc") or not tokens.get("examEnc"):
-                continue
+        total = len(filtered)
+        if total == 0:
+            return []
 
-            # Fetch homework and exams
+        # ================================================================
+        # 阶段 1：串行获取 Token（避免并发 Token 请求触发反爬）
+        # ================================================================
+        # get_course_tokens 内部会先检查缓存，有缓存则立即返回无延迟
+        logger.info(f"[阶段1] 串行获取 {total} 门课程的 Token...")
+        course_token_pairs = []
+        token_fetch_start = time.time()
+        for idx, course in enumerate(filtered):
+            # 获取 token：有缓存直接返回，无缓存则内部 sleep 1.5s 后请求
+            cooldown = cfg.get("token_cooldown", 60)
+            tokens = self.get_course_tokens(course, cooldown_sec=cooldown)
+            if tokens and tokens.get("workEnc") and tokens.get("examEnc"):
+                course_token_pairs.append((course, tokens))
+            # 每 5 门课输出一次进度
+            if (idx + 1) % 5 == 0 or idx == total - 1:
+                logger.info(f"  [阶段1进度] {idx+1}/{total} 门课程，已获 Token: {len(course_token_pairs)} 门")
+
+        token_fetch_elapsed = time.time() - token_fetch_start
+        logger.info(
+            f"[阶段1完成] {len(course_token_pairs)}/{total} 门课程获 Token，"
+            f"耗时 {token_fetch_elapsed:.1f}s"
+        )
+
+        if not course_token_pairs:
+            logger.warning("[阶段1] 没有任何课程获取到 Token，跳过阶段2")
+            return []
+
+        # ================================================================
+        # 阶段间恢复期：等待 30 秒让 session 的请求配额重置，
+        # 避免阶段 2 的并发请求立即触发反爬。
+        # ================================================================
+        logger.info("[阶段间] 等待 15s 让 session 请求配额恢复...")
+        time.sleep(15)
+        logger.info("[阶段间] 恢复完成，开始阶段2")
+
+        # ================================================================
+        # 阶段 2：并发获取作业/考试列表（错峰启动，避免突发请求）
+        # ================================================================
+        all_tasks: list = []
+        scanned = 0
+        pair_total = len(course_token_pairs)
+        lock = threading.Lock()
+        hide_nd = cfg.get("hide_no_deadline", False)
+
+        def _fetch_course_data(course: dict, tokens: dict, start_delay: float = 0) -> list:
+            """
+            单个课程的作业/考试列表抓取（在线程池中并发执行）。
+            被阶段 2 的 ThreadPoolExecutor 调用。
+
+            参数:
+                start_delay: 启动延迟（秒），用于错峰启动各线程，避免触发反爬。
+            """
+            nonlocal scanned
+            if start_delay > 0:
+                time.sleep(start_delay)
+
             hws = self._get_homework_list(course, tokens)
             exams = self._get_exam_list(course, tokens)
-            
-            # Filter for unfinished ones
-            # Unfinished if status in ["未交", "进行中", "待做"]
-            unfinished_hws = [h for h in hws if h["status"] in ["未交", "进行中", "待做"]]
-            unfinished_exams = [e for e in exams if e["status"] in ["未交", "进行中", "待做"]]
-            
-            if unfinished_hws or unfinished_exams:
-                print(f"[{scanned}/{total_courses}] {title} - 未完成作业: {len(unfinished_hws)}，未完成考试: {len(unfinished_exams)}")
-                
-            results.extend(unfinished_hws)
-            results.extend(unfinished_exams)
-            
-            # Avoid rate limits
-            time.sleep(2.0)
-            
-        return results
+
+            # 筛选未完成的任务（同时过滤已过截止时间的）
+            unfinished = []
+            for h in hws:
+                if _is_unfinished(h["status"]) and not _is_overdue(h.get("deadline", ""), hide_nd):
+                    unfinished.append(h)
+            for e in exams:
+                if _is_unfinished(e["status"]) and not _is_overdue(e.get("deadline", ""), hide_nd):
+                    unfinished.append(e)
+
+            with lock:
+                scanned += 1
+                title = course.get("title", "未知课程")
+                if unfinished:
+                    logger.info(f"[{scanned}/{pair_total}] {title} - 未完成: {len(unfinished)}项")
+                else:
+                    logger.debug(f"[{scanned}/{pair_total}] {title} - 全部完成")
+
+            # 线程内速率控制，避免集中请求触发反爬（即使有错峰，内部仍保留速率控制）
+            time.sleep(rate_limit_delay)
+            return unfinished
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            # 错峰启动：第 i 个线程延迟 i * 2 秒启动，确保同一时间只有 1 个线程发起首次请求
+            for i, (course, tokens) in enumerate(course_token_pairs):
+                delay = i * 1.0  # 每个课程间隔 1 秒启动，兼顾速度和防反爬
+                future = executor.submit(_fetch_course_data, course, tokens, delay)
+                futures.append(future)
+
+            for f in futures:
+                try:
+                    result = f.result()
+                    if result:
+                        all_tasks.extend(result)
+                except Exception as e:
+                    logger.error(f"扫描课程线程异常: {e}")
+
+        return all_tasks
 
     # ----- 活跃活动（签到等）-----
 
@@ -890,426 +1178,376 @@ class XuexitongClient:
                 if data.get("result") == 1:
                     return data.get("data", {}).get("activeList", [])
         except Exception as e:
-            print(f"[活动] {course.get('title', course_id)} 查询失败: {e}")
+            logger.warning(f"[活动] {course.get('title', course_id)} 查询失败: {e}")
         return []
 
 
 # ============================================================
-# 桌面通知
+# 未完成任务判断（解决硬编码中文匹配的脆弱性）
 # ============================================================
 
-def show_notification(title: str, message: str):
+# 已知的"未完成"状态集合（精确匹配）
+_KNOWN_UNFINISHED = frozenset({"未交", "进行中", "待做"})
+
+
+
+
+def _is_unfinished(status: str) -> bool:
     """
-    弹出 Windows 桌面通知（使用 plyer）
-    plyer 在 Windows 上使用 winrt 实现原生 Toast 通知
+    判断作业/考试状态是否为"未完成"
+    严格匹配 _KNOWN_UNFINISHED 集合（当前：未交 / 进行中 / 待做）
+    被 get_unfinished_tasks()、check_and_notify() 的扫描线程调用
     """
-    try:
-        notification.notify(
-            title=title,
-            message=message,
-            app_name="学习通通知",
-            timeout=8,
-        )
-    except Exception as e:
-        print(f"[通知] 弹窗失败: {e}")
+    return status in _KNOWN_UNFINISHED
 
 
-# ============================================================
-# 状态管理
-# ============================================================
+def _is_overdue(deadline: str, hide_no_deadline: bool = False) -> bool:
+    """
+    判断任务的截止时间是否已过（通过解析倒计时文本）
+    被 get_unfinished_tasks()、check_and_notify() 的扫描线程调用，
+    用于过滤已过期的任务
 
-def load_state() -> dict:
-    """从 state.json 加载已通知状态"""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {
-        "seen_notices": {},    # {课程ID: 最后已知的未完成任务列表hash}
-        "last_notice_count": 0,
-    }
+    支持的 deadline 格式（实测学习通使用"还剩"前缀）：
+    - "还剩 X 天 Y 小时" / "剩余 X 天 Y 小时" → 计算总剩余小时
+    - "还剩 X 小时 Y 分钟" / "剩余 X 小时"     → 同上，忽略分钟
+    - "无截止时间"                              → 根据 hide_no_deadline 决定
+    - 无法解析的格式                            → 保守不算过期
 
+    参数:
+        hide_no_deadline: 为 True 时，"无截止时间"也算过期（隐藏）
+    返回 True 表示已过期，应该隐藏
+    """
+    if not deadline or deadline == "无截止时间":
+        return hide_no_deadline
 
-def save_state(state: dict):
-    """持久化状态到 state.json"""
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    found = False
+    total_hours = 0
+
+    # 匹配 "剩余/还剩 X 天"
+    m = re.search(r'(?:剩余|还剩)\s*(\d+)\s*天', deadline)
+    if m:
+        total_hours += int(m.group(1)) * 24
+        found = True
+
+    # 匹配 "X 小时"（可能是"5 小时"或"682 小时25 分钟"中的小时部分）
+    m = re.search(r'(\d+)\s*小时', deadline)
+    if m:
+        total_hours += int(m.group(1))
+        found = True
+
+    # 没解析到任何时间 → 保守处理，不认定为过期
+    if not found:
+        return False
+
+    # 解析到时间但剩余 ≤ 0 → 已过期
+    return total_hours <= 0
+
 
 
 def load_config() -> dict:
-    """加载配置文件"""
+    """
+    加载配置文件，与 DEFAULT_CONFIG 合并（用户配置优先覆盖默认值）
+    被 main()、run_list_tasks()、GUI 入口调用
+    """
+    config = dict(DEFAULT_CONFIG)  # 深拷贝默认值
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+            user_config: dict = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(user_config, dict):
+                config.update(user_config)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"加载 config.json 失败，使用默认配置: {e}")
+    return config
 
 
 def save_config(config: dict):
-    """保存配置文件"""
+    """
+    保存配置文件（与现有文件合并，避免丢失未涉及的字段）
+    被 login、GUI logout、main() 等调用
+    """
+    # 读取现有配置，保留不在本次写入中的字段
+    if CONFIG_FILE.exists():
+        try:
+            existing = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                existing.update(config)
+                config = existing
+        except (json.JSONDecodeError, OSError):
+            pass
     CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================================================
-# 主逻辑
+# 开机自启管理（Windows 注册表）
 # ============================================================
 
-def initial_setup() -> tuple:
+# Windows 注册表 Run 键路径，用于存储开机自启条目
+_AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# 注册表中的条目名称
+_AUTOSTART_NAME = "XuexitongNotifier"
+
+
+def is_autostart_enabled() -> bool:
     """
-    首次运行设置：提示用户输入手机号和密码
-    保存到 config.json
+    检查开机自启是否已开启。
+    通过查询注册表 Run 键判断是否存在本程序条目。
+    被 GUI 的自启开关初始化时调用。
     """
-    print("=" * 50)
-    print("  学习通通知小工具 - 首次设置")
-    print("=" * 50)
-    print("请输入学习通账号信息：")
-    phone = input("手机号: ").strip()
-    password = input("密码: ").strip()
-    if not phone or not password:
-        print("[错误] 手机号和密码不能为空")
-        sys.exit(1)
-
-    config = {"phone": phone, "password": password}
-    save_config(config)
-    print("[设置] 账号已保存到 config.json")
-    return phone, password
-
-
-def display_courses(client: XuexitongClient):
-    """获取并打印所有课程名称（简洁版）"""
-    courses = client.get_course_list()
-    if not courses:
-        print("[课程] 没有获取到课程数据")
-        return
-
-    print(f"\n  共 {len(courses)} 门课程：")
-    for course in courses:
-        title = course.get("title") or course.get("courseId", "未知课程")
-        print(f"  · {title}")
-    print()
-
-
-def check_and_notify(client: XuexitongClient, state: dict) -> dict:
-    """
-    核心检测逻辑：
-    1. 检查通知数
-    2. 遍历所有课程，检查未完成任务
-    3. 如果有新的未完成任务，弹出通知
-    返回更新后的 state
-    """
-    # --- 第一步：检查通知数（轻量快速） ---
-    notice_count = client.get_notice_count()
-    if notice_count > 0:
-        print(f"[检测] 未读通知数: {notice_count}")
-
-    # 如果通知数有增加，标记需要深入检测
-    need_deep_check = (
-        notice_count > 0
-        and notice_count != state.get("last_notice_count", 0)
-    )
-    state["last_notice_count"] = notice_count
-
-    # --- 第二步：获取课程列表 ---
-    courses = client.get_course_list()
-    if not courses:
-        print("[检测] 未获取到课程列表，跳过本次检测")
-        return state
-
-    # --- 第三步：遍历课程，检测未完成任务 ---
-    seen = state.setdefault("seen_notices", {})
-    summary_lines = []
-    any_unfinished_found = False
-
-    for course in courses:
-        title = course.get("title", course.get("courseId", "未知课程"))
-        course_key = course.get("courseId", "") or course.get("id", "")
-
-        if course.get("is_ended"):
-            continue
-
-        # 获取未完成的任务列表
-        unfinished = client.get_course_unfinished(course)
-        total = sum(c for _, c in unfinished)
-
-        # 没有未完成的任务，直接跳过不显示
-        if total == 0:
-            continue
-
-        if total > 0:
-            any_unfinished_found = True
-
-        # 检查是否需要弹窗通知
-        serialized_str = str(sorted(unfinished)).encode("utf-8")
-        current_hash = hashlib.md5(serialized_str).hexdigest()
-        last_hash = seen.get(course_key, 0)
-        if current_hash != last_hash and need_deep_check:
-            items = [f"  • {ptitle}" for ptitle, _ in unfinished[:3]]
-            detail = "\n".join(items)
-            if len(unfinished) > 3:
-                detail += f"\n  ...还有 {len(unfinished) - 3} 个任务"
-
-            msg = f"课程：{title}\n共有 {total} 个未完成任务\n\n{detail}"
-            print(f"[新任务] {title}: {total} 个未完成")
-            show_notification("📚 学习通 - 有新的作业/任务", msg)
-
-        # 更新 state
-        seen[course_key] = current_hash
-
-        # 汇总显示：添加课程标题和每一个任务的名字
-        summary_lines.append(f"  {title}: ⚠️ {total}项")
-        for ptitle, _ in unfinished:
-            summary_lines.append(f"    - {ptitle}")
-        
-        # 避免请求频率过高，每次课程检查后延迟
-        time.sleep(2.0)
-
-    # 打印本轮课程摘要
-    if summary_lines:
-        print("课程状态:")
-        for line in summary_lines:
-            print(line)
-
-    # --- 第四步：如果有通知数但通知详情里没有找到具体任务，
-    #             也可能是考试通知，发个通用提示 ---
-    if notice_count > 0:
-        if not any_unfinished_found and need_deep_check:
-            show_notification(
-                "📢 学习通通知",
-                f"您有 {notice_count} 条未读通知，请打开学习通查看",
-            )
-
-    return state
-
-
-# ============================================================
-# --list-tasks 子命令：列出未完成作业/考试
-# ============================================================
-
-def list_unfinished_tasks(client: XuexitongClient, output_file: Optional[Path] = None) -> list:
-    """
-    拉取所有未完成作业/考试，打印控制台表格，导出 JSON。
-    output_file: JSON 写入路径，None 时用 BASE_DIR/unfinished_tasks.json
-    """
-    print("[扫描] 正在拉取课程列表...")
-    courses = client.get_course_list()
-    if not courses:
-        print("[扫描] 未获取到课程列表")
-        return []
-    print(f"[扫描] 共 {len(courses)} 门课程，开始检查未完成任务点...")
-
-    tasks = client.get_unfinished_tasks(courses)
-    print(f"\n[完成] 共发现 {len(tasks)} 个未完成作业/考试")
-
-    # 控制台表格
-    print_tasks_table(tasks)
-
-    # 导出 JSON
-    out = output_file or (BASE_DIR / "unfinished_tasks.json")
-    out.write_text(
-        json.dumps(tasks, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"\n[导出] 已写入 {out}（{out.stat().st_size} 字节）")
-    return tasks
-
-
-def print_tasks_table(tasks: list):
-    """
-    Print table formatting: # | Course | Task Name | Type | Status | Deadline | Link
-    """
-    if not tasks:
-        print("  (无)")
-        return
-        
-    def truncate(s: str, n: int) -> str:
-        s = str(s).replace("\u200b", "")
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_READ)
         try:
-            enc = sys.stdout.encoding or "utf-8"
-            s = s.encode(enc, errors="replace").decode(enc)
-        except Exception:
-            pass
-        return s if len(s) <= n else s[: n - 1] + "…"
-
-    course_w = max(len("课程"), min(20, max(len(t["course"]) for t in tasks)))
-    name_w = max(len("任务名称"), min(25, max(len(t["name"]) for t in tasks)))
-    type_w = 6
-    status_w = 6
-    deadline_w = max(len("截止时间"), min(20, max(len(t["deadline"]) for t in tasks)))
-    idx_w = max(4, len(str(len(tasks))))
-
-    header = f"{'#':>{idx_w}}  {'课程':<{course_w}}  {'任务名称':<{name_w}}  {'类型':<{type_w}}  {'状态':<{status_w}}  {'截止时间':<{deadline_w}}  链接"
-    sep = "-" * len(header)
-    print(sep)
-    print(header)
-    print(sep)
-    for i, t in enumerate(tasks, 1):
-        course = truncate(t["course"], course_w)
-        name = truncate(t["name"], name_w)
-        ttype = t["type"]
-        status = t["status"]
-        deadline = truncate(t["deadline"], deadline_w)
-        url = t["url"]
-        line = f"{i:>{idx_w}}  {course:<{course_w}}  {name:<{name_w}}  {ttype:<{type_w}}  {status:<{status_w}}  {deadline:<{deadline_w}}  {url}"
-        try:
-            print(line)
-        except Exception:
-            try:
-                enc = sys.stdout.encoding or "utf-8"
-                print(line.encode(enc, errors="replace").decode(enc))
-            except Exception:
-                print(line.encode("ascii", errors="replace").decode("ascii"))
-    print(sep)
-
-
-def run_list_tasks(output_file: Optional[Path] = None) -> Optional[list]:
-    """
-    --list-tasks 入口：登录 → 扫描 → 表格 + JSON
-    """
-    print("=" * 60)
-    print("  学习通未完成作业/考试扫描")
-    print("=" * 60)
-
-    # 加载配置
-    config = load_config()
-    client = XuexitongClient()
-
-    def do_login() -> bool:
-        """执行登录，失败直接退出（不进入主循环）"""
-        if client.login(config["phone"], config["password"]):
+            winreg.QueryValueEx(key, _AUTOSTART_NAME)
             return True
-        print("[错误] 登录失败！请检查账号或加密方式")
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
         return False
 
-    # 优先用 cookies
-    if config.get("cookies") and client.load_cookies(config["cookies"]):
-        test_courses = client.get_course_list()
-        if test_courses:
-            print("[登录] 使用已保存的会话（有效）")
-        else:
-            print("[登录] 会话已过期，尝试密码登录")
-            if not do_login():
-                sys.exit(1)
-    else:
-        if not do_login():
-            sys.exit(1)
 
-    # 保存最新 cookies
-    config["cookies"] = client.get_cookies()
-    save_config(config)
+def set_autostart(enable: bool) -> bool:
+    """
+    设置/取消开机自启。
+    enable=True：在注册表 Run 键中创建条目，指向 pythonw.exe -m xxt_gui
+    enable=False：删除该注册表条目
+    被 GUI 的自启开关点击时调用。
 
-    # 执行扫描
-    list_unfinished_tasks(client, output_file)
-
-
-def main():
-    """主入口"""
-    print("=" * 50)
-    print("  学习通作业考试通知小工具")
-    print("  Xuexitong Notifier v1.0")
-    print("=" * 50)
-
-    # 处理 --reset 参数：清除已保存的配置
-    if "--reset" in sys.argv or "-r" in sys.argv:
-        if CONFIG_FILE.exists():
-            CONFIG_FILE.unlink()
-            print(f"[重置] 已清除 {CONFIG_FILE}")
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-            print(f"[重置] 已清除 {STATE_FILE}")
-        print("[重置] 重新启动即可重新输入账号密码")
-        return
-
-    # 处理 --list-tasks 参数：列出未完成作业/考试并退出
-    if "--list-tasks" in sys.argv or "-l" in sys.argv:
-        # 自定义输出文件：--output xxx.json
-        out_path = None
-        for i, a in enumerate(sys.argv):
-            if a in ("--output", "-o") and i + 1 < len(sys.argv):
-                out_path = Path(sys.argv[i + 1])
-                break
-        run_list_tasks(out_path)
-        return
-
-    # 加载配置
-    config = load_config()
-    if not config.get("phone") or not config.get("password"):
-        phone, password = initial_setup()
-        config = load_config()  # 重新加载完整配置（含刚保存的）
-    else:
-        phone = config["phone"]
-        password = config["password"]
-        print(f"[配置] 已加载账号: {phone}")
-
-    # 初始化客户端
-    client = XuexitongClient()
-
-    def do_login() -> bool:
-        """执行登录，失败时提示重试"""
-        if client.login(phone, password):
-            return True
-        print("[错误] 登录失败！可能是密码错误或加密方式已变更")
-        retry = input("按 R 重新输入账号密码，或按 Enter 退出: ").strip().upper()
-        if retry == "R":
-            # 清除旧配置，重新开始
-            if CONFIG_FILE.exists():
-                CONFIG_FILE.unlink()
-            return False
-        sys.exit(1)
-
-    # 如果有保存的 cookies，优先尝试
-    if config.get("cookies"):
-        if client.load_cookies(config["cookies"]):
-            print("[登录] 尝试使用已保存的会话...")
-            test_courses = client.get_course_list()
-            if test_courses:
-                print("[登录] 会话有效，跳过密码登录")
-            else:
-                print("[登录] 会话已过期")
-                while not do_login():
-                    phone, password = initial_setup()
-        else:
-            while not do_login():
-                phone, password = initial_setup()
-    else:
-        while not do_login():
-            phone, password = initial_setup()
-
-    # 保存 cookies 供下次使用
-    config["cookies"] = client.get_cookies()
-    save_config(config)
-
-    # 显示课程列表
-    display_courses(client)
-
-    # 加载状态
-    state = load_state()
-    print(f"[启动] 轮询间隔: {POLL_INTERVAL}秒 ({POLL_INTERVAL // 60}分钟)")
-
-    # 首轮立即检测
-    print("\n[首轮] 正在检查未完成任务...")
-    state = check_and_notify(client, state)
-    save_state(state)
-    print("[完成] 首轮检测完成")
-
-    # 定时轮询
-    while True:
+    使用 pythonw.exe 而非 python.exe，避免开机启动时弹出控制台窗口。
+    返回值表示操作是否成功。
+    """
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE)
         try:
-            time.sleep(POLL_INTERVAL)
-            now = datetime.now().strftime("%H:%M:%S")
-            print(f"\n[{now}] 检查中...")
-            state = check_and_notify(client, state)
-            save_state(state)
-            print(f"[{now}] 检测完成")
-        except KeyboardInterrupt:
-            print("\n[退出] 用户中断")
-            save_state(state)
-            break
-        except Exception as e:
-            print(f"[错误] 检测异常: {e}")
-            # 异常后等待短时间继续
-            time.sleep(60)
+            if enable:
+                # pythonw.exe 路径（无控制台窗口）
+                pythonw = str(BASE_DIR / ".venv" / "Scripts" / "pythonw.exe")
+                if not Path(pythonw).exists():
+                    # 回退到 python.exe
+                    pythonw = str(BASE_DIR / ".venv" / "Scripts" / "python.exe")
+                args = "-m xxt_gui"
+                # 用引号括起路径，防止路径含空格时解析错误
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{pythonw}" {args}')
+                logger.info(f"开机自启已开启: {pythonw} {args}")
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+                    logger.info("开机自启已关闭")
+                except FileNotFoundError:
+                    pass  # 本来就没有条目
+            return True
+        finally:
+            winreg.CloseKey(key)
+    except Exception as e:
+        logger.error(f"设置开机自启失败: {e}")
+        return False
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# 任务状态持久化（用于检测关闭期间发布的新任务）
+# ============================================================
+
+STATE_FILE = BASE_DIR / "state.json"
+
+
+def load_task_state() -> dict:
+    """
+    从 state.json 加载已保存的任务状态。
+    返回格式: {"seen_keys": ["课程|任务名|类型", ...], "last_scan": 时间戳}
+    被 GUI 启动时调用，用于对比检测新任务。
+    """
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"加载 state.json 失败: {e}")
+    return {"seen_keys": []}
+
+
+def save_task_state(tasks: list):
+    """
+    将当前任务列表写入 state.json。
+    seen_keys 累积保存（旧 key 保留 + 新 key 追加），避免重复通知。
+    被 GUI 每次扫描完成后调用。
+    """
+    # 计算当前所有任务的特征 key
+    current_keys = set()
+    for t in tasks:
+        key = f"{t.get('course','')}|{t.get('name','')}|{t.get('type','')}"
+        current_keys.add(key)
+
+    try:
+        old = load_task_state()
+        old_seen = set(old.get("seen_keys", []))
+        # 合并旧 key（历史已通知的）和新 key（当前任务）
+        old_seen.update(current_keys)
+        state = {
+            "seen_keys": sorted(old_seen),
+            "last_scan": time.time(),
+        }
+        STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"保存 state.json 失败: {e}")
+
+
+def find_new_tasks(current_tasks: list) -> list:
+    """
+    对比 state.json 中的 seen_keys，找出 current_tasks 中从未见过的新任务。
+    被 GUI 启动时调用，用于弹窗通知。
+    返回新任务列表（按 current_tasks 顺序）。
+    """
+    state = load_task_state()
+    seen = set(state.get("seen_keys", []))
+    new_tasks = []
+    for t in current_tasks:
+        key = f"{t.get('course','')}|{t.get('name','')}|{t.get('type','')}"
+        if key not in seen:
+            new_tasks.append(t)
+    return new_tasks
+
+
+def show_notification(title: str, message: str, tk_root=None):
+    """
+    弹出右下角自定义浮窗通知。
+    使用 tkinter 窗口实现，不依赖 Windows 通知系统，
+    保证在所有 Windows 版本上可靠弹出。
+
+    参数:
+        title: 通知标题
+        message: 通知内容（支持 \\n 换行）
+        tk_root: 可选的 tkinter 根窗口。
+                 从 GUI 调用时传入 root，使用 Toplevel 挂载（不阻塞）。
+                 独立调用时不传，自动创建临时 Tk 窗口。
+    """
+    import tkinter as tk
+    import winsound
+
+    # 日志
+    safe_title = title.encode('ascii', errors='replace').decode('ascii')
+    safe_msg = message.replace('\n', ' | ').encode('ascii', errors='replace').decode('ascii')
+    logger.info(f"[通知] {safe_title}: {safe_msg}")
+
+    # 播放系统提示音（异步，不阻塞）
+    try:
+        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+    except Exception:
+        pass
+
+    # ---------- 决定窗口类型 ----------
+    standalone = tk_root is None
+    if standalone:
+        popup = tk.Tk()
+    else:
+        popup = tk.Toplevel(tk_root)
+
+    popup.withdraw()  # 先隐藏，计算布局后再显示
+    popup.overrideredirect(True)        # 无标题栏/边框
+    popup.attributes("-topmost", True)  # 始终置顶
+    popup.configure(bg="#1e1e2e")
+
+    # ---------- 尺寸与位置 ----------
+    W, H = 380, 140
+    screen_w = popup.winfo_screenwidth()
+    screen_h = popup.winfo_screenheight()
+
+    # 堆叠偏移：追踪当前显示的通知数
+    if not hasattr(show_notification, '_stack_offset'):
+        show_notification._stack_offset = 0
+    offset = show_notification._stack_offset * (H + 10)
+    show_notification._stack_offset += 1
+
+    x = screen_w - W - 20
+    y = screen_h - H - 60 - offset  # 60 = 任务栏高度预留
+    popup.geometry(f"{W}x{H}+{x}+{y}")
+
+    # ---------- 外框（模拟边框） ----------
+    border_frame = tk.Frame(popup, bg="#5966f3", padx=2, pady=2)
+    border_frame.pack(fill="both", expand=True)
+
+    card = tk.Frame(border_frame, bg="#212130", padx=14, pady=10)
+    card.pack(fill="both", expand=True)
+
+    # ---------- 标题行 ----------
+    top_row = tk.Frame(card, bg="#212130")
+    top_row.pack(fill="x")
+
+    # 清理 emoji（避免 tkinter 字体问题）
+    clean_title = title
+    for ch in "📚📝📋🔔⚠️":
+        clean_title = clean_title.replace(ch, "")
+    clean_title = clean_title.strip()
+
+    lbl_icon = tk.Label(top_row, text="\u2709", bg="#212130", fg="#5966f3",
+                        font=("Microsoft YaHei", 14))
+    lbl_icon.pack(side="left", padx=(0, 6))
+
+    lbl_title = tk.Label(top_row, text=clean_title, bg="#212130", fg="#ffffff",
+                         font=("Microsoft YaHei", 11, "bold"), anchor="w")
+    lbl_title.pack(side="left", fill="x", expand=True)
+
+    # 关闭按钮
+    btn_close = tk.Label(top_row, text="\u2715", bg="#212130", fg="#6c7086",
+                         font=("Consolas", 12, "bold"), cursor="hand2", padx=4)
+    btn_close.pack(side="right")
+
+    # ---------- 分隔线 ----------
+    sep = tk.Frame(card, bg="#313145", height=1)
+    sep.pack(fill="x", pady=(6, 6))
+
+    # ---------- 消息内容 ----------
+    display_msg = message if len(message) <= 120 else message[:117] + "..."
+    lbl_msg = tk.Label(card, text=display_msg, bg="#212130", fg="#bac2de",
+                       font=("Microsoft YaHei", 9), anchor="w", justify="left",
+                       wraplength=W - 40)
+    lbl_msg.pack(fill="x", expand=True)
+
+    # ---------- 底部标签 ----------
+    lbl_app = tk.Label(card, text="学习通扫描器", bg="#212130", fg="#45475a",
+                       font=("Microsoft YaHei", 8), anchor="e")
+    lbl_app.pack(fill="x", pady=(4, 0))
+
+    # ---------- 关闭与淡出 ----------
+    def _close():
+        show_notification._stack_offset = max(0, show_notification._stack_offset - 1)
+        try:
+            popup.destroy()
+        except Exception:
+            pass
+
+    def _fade_out(alpha=1.0):
+        if alpha <= 0:
+            _close()
+            return
+        try:
+            popup.attributes("-alpha", alpha)
+            popup.after(50, lambda: _fade_out(alpha - 0.05))
+        except Exception:
+            pass
+
+    # 绑定关闭按钮
+    btn_close.bind("<Button-1>", lambda e: _close())
+    btn_close.bind("<Enter>", lambda e: btn_close.configure(fg="#f38ba8"))
+    btn_close.bind("<Leave>", lambda e: btn_close.configure(fg="#6c7086"))
+
+    # 8 秒后开始淡出
+    popup.after(8000, _fade_out)
+
+    # 点击窗口任意处也可关闭
+    for widget in [card, border_frame, lbl_msg, lbl_title, lbl_app, sep, lbl_icon]:
+        widget.bind("<Button-1>", lambda e: _close())
+
+    # ---------- 显示 ----------
+    popup.deiconify()
+
+    # 独立模式需要自己的 mainloop；GUI 模式下由主窗口 mainloop 驱动
+    if standalone:
+        popup.mainloop()
+
+
+def run_gui():
+    """GUI 入口点（被 start.bat 或直接调用）"""
+    from xxt_gui import main as gui_main
+    gui_main()
