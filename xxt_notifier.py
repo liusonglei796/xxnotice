@@ -11,6 +11,7 @@
 from pathlib import Path
 import json
 import time
+import hashlib
 import re
 import sys
 from datetime import datetime
@@ -1018,6 +1019,7 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
     # --- 第三步：遍历课程，检测未完成任务 ---
     seen = state.setdefault("seen_notices", {})
     summary_lines = []
+    any_unfinished_found = False
 
     for course in courses:
         title = course.get("title", course.get("courseId", "未知课程"))
@@ -1034,8 +1036,12 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
         if total == 0:
             continue
 
+        if total > 0:
+            any_unfinished_found = True
+
         # 检查是否需要弹窗通知
-        current_hash = hash(str(sorted(unfinished)))
+        serialized_str = str(sorted(unfinished)).encode("utf-8")
+        current_hash = hashlib.md5(serialized_str).hexdigest()
         last_hash = seen.get(course_key, 0)
         if current_hash != last_hash and need_deep_check:
             items = [f"  • {ptitle}" for ptitle, _ in unfinished[:3]]
@@ -1067,12 +1073,7 @@ def check_and_notify(client: XuexitongClient, state: dict) -> dict:
     # --- 第四步：如果有通知数但通知详情里没有找到具体任务，
     #             也可能是考试通知，发个通用提示 ---
     if notice_count > 0:
-        # 检查是否至少有一个课程有未完成任务
-        any_unfinished = any(
-            client.get_course_unfinished(course)
-            for course in courses[:3]  # 只检查前3门就够了
-        )
-        if not any_unfinished and need_deep_check:
+        if not any_unfinished_found and need_deep_check:
             show_notification(
                 "📢 学习通通知",
                 f"您有 {notice_count} 条未读通知，请打开学习通查看",
