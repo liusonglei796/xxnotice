@@ -676,6 +676,7 @@ class DashboardFrame(tk.Frame):
         self.current_tab = "作业"  # '作业' or '考试'
         self._is_fetching = False
         self._poll_job_id = None  # 后台轮询定时器 ID，用于取消/防堆叠
+        self.is_first_scan = True
         
         # 1. Header Frame
         header = tk.Frame(self, bg=THEME["card_bg"], height=70, padx=20)
@@ -772,13 +773,23 @@ class DashboardFrame(tk.Frame):
         self.btn_refresh.configure(state="disabled", text="扫描中...")
         self.lbl_loading.configure(text="⏳ 正在扫描所有课程的作业和考试，请稍候...")
         
+        is_first = self.is_first_scan or force
+        self.is_first_scan = False
+
+        cfg = dict(self.controller.config)
+        cfg["is_first_scan"] = is_first
+        cfg["retry_round_wait"] = 60
+
+        def update_progress_lbl(data):
+            msg = data.get("message", "正在扫描...")
+            self.after(0, lambda: self.lbl_loading.configure(text=msg, fg=THEME["fg_dim"]))
+
         def _worker(manual=force):
             """manual=True 表示手动刷新，完成后弹通知；
                manual=False 表示自动轮询，有新任务才弹。
             """
             try:
-                cfg = self.controller.config
-                tasks = self.controller.client.get_unfinished_tasks(config=cfg)
+                tasks = self.controller.client.get_unfinished_tasks(config=cfg, progress_callback=update_progress_lbl)
             except Exception as e:
                 logger.error(f"[GUI] Fetch error: {e}")
                 tasks = []

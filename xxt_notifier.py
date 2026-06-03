@@ -1017,7 +1017,7 @@ class XuexitongClient:
             return "作业"
         return "未知"
 
-    def get_unfinished_tasks(self, courses: Optional[list] = None, config: Optional[dict] = None) -> list:
+    def get_unfinished_tasks(self, courses: Optional[list] = None, config: Optional[dict] = None, progress_callback=None) -> list:
         """
         两阶段扫描所有课程，返回未完成作业/考试的任务列表
 
@@ -1030,6 +1030,7 @@ class XuexitongClient:
         参数:
             courses: 课程列表，None 时自动获取
             config: 配置字典（max_workers、only_courses、rate_limit_delay）
+            progress_callback: 进度回调函数，用于汇报多轮重试进度
         """
         if courses is None:
             courses = self.get_course_list()
@@ -1038,6 +1039,7 @@ class XuexitongClient:
         max_workers = cfg.get("max_workers", 8)
         rate_limit_delay = cfg.get("rate_limit_delay", 1.0)
         only_courses = cfg.get("only_courses", [])
+        hide_nd = cfg.get("hide_no_deadline", False)
 
         # 过滤：跳过已结束的课程 + 白名单过滤
         filtered = []
@@ -1051,105 +1053,221 @@ class XuexitongClient:
                     continue
             filtered.append(course)
 
-        total = len(filtered)
-        if total == 0:
-            return []
+        is_first_scan = cfg.get("is_first_scan", False)
+        max_rounds = 5 if is_first_scan else 1
+        remaining_courses = list(filtered)
+        all_tasks = []
 
-        # ================================================================
-        # 阶段 1：串行获取 Token（避免并发 Token 请求触发反爬）
-        # ================================================================
-        # get_course_tokens 内部会先检查缓存，有缓存则立即返回无延迟
-        logger.info(f"[阶段1] 串行获取 {total} 门课程的 Token...")
-        course_token_pairs = []
-        token_fetch_start = time.time()
-        for idx, course in enumerate(filtered):
-            # 获取 token：有缓存直接返回，无缓存则内部 sleep 1.5s 后请求
-            cooldown = cfg.get("token_cooldown", 60)
-            tokens = self.get_course_tokens(course, cooldown_sec=cooldown)
-            if tokens and tokens.get("workEnc") and tokens.get("examEnc"):
-                course_token_pairs.append((course, tokens))
-            # 每 5 门课输出一次进度
-            if (idx + 1) % 5 == 0 or idx == total - 1:
-                logger.info(f"  [阶段1进度] {idx+1}/{total} 门课程，已获 Token: {len(course_token_pairs)} 门")
+        for round_idx in range(1, max_rounds + 1):
+            if not remaining_courses:
+                break
 
-        token_fetch_elapsed = time.time() - token_fetch_start
-        logger.info(
-            f"[阶段1完成] {len(course_token_pairs)}/{total} 门课程获 Token，"
-            f"耗时 {token_fetch_elapsed:.1f}s"
-        )
+            msg = f"开始第 {round_idx}/{max_rounds} 轮扫描，剩余 {len(remaining_courses)} 门课程"
+            logger.info(msg)
+            if progress_callback:
+                progress_callback({
+                    "status": "round_start",
+                    "round": round_idx,
+                    "max_rounds": max_rounds,
+                    "remaining": len(remaining_courses),
+                    "message": msg
+                })
 
-        if not course_token_pairs:
-            logger.warning("[阶段1] 没有任何课程获取到 Token，跳过阶段2")
-            return []
+            # 清理剩余课程的缓存冷却标记
+            with self._cache_lock:
+                cleared_count = 0
+                for course in remaining_courses:
+                    cid = str(course.get("courseId", "") or course.get("id", ""))
+                    if cid in self.tokens_cache:
+                        cached = self.tokens_cache[cid]
+                        if "cooldown_until" in cached:
+                            cached.pop("cooldown_until", None)
+                            cleared_count += 1
+                if cleared_count > 0:
+                    self.save_tokens_cache()
+            if cleared_count > 0:
+                logger.info(f"已清理 {cleared_count} 门剩余课程的缓存冷却标记")
 
-        # ================================================================
-        # 阶段间恢复期：等待 30 秒让 session 的请求配额重置，
-        # 避免阶段 2 的并发请求立即触发反爬。
-        # ================================================================
-        logger.info("[阶段间] 等待 15s 让 session 请求配额恢复...")
-        time.sleep(15)
-        logger.info("[阶段间] 恢复完成，开始阶段2")
+            # ================================================================
+            # 阶段 1：串行获取 Token（避免并发 Token 请求触发反爬）
+            # ================================================================
+            course_token_pairs = []
+            failed_in_phase1 = []
+            total_remaining = len(remaining_courses)
+            logger.info(f"[阶段1] 串行获取 {total_remaining} 门课程的 Token...")
+            token_fetch_start = time.time()
 
-        # ================================================================
-        # 阶段 2：并发获取作业/考试列表（错峰启动，避免突发请求）
-        # ================================================================
-        all_tasks: list = []
-        scanned = 0
-        pair_total = len(course_token_pairs)
-        lock = threading.Lock()
-        hide_nd = cfg.get("hide_no_deadline", False)
+            for idx, course in enumerate(remaining_courses):
+                # 汇报阶段 1 进度
+                if progress_callback:
+                    progress_callback({
+                        "status": "scanning",
+                        "phase": 1,
+                        "current": idx + 1,
+                        "total": total_remaining,
+                        "message": f"正在获取第 {idx+1}/{total_remaining} 门课程 Token: {course.get('title')}"
+                    })
 
-        def _fetch_course_data(course: dict, tokens: dict, start_delay: float = 0) -> list:
-            """
-            单个课程的作业/考试列表抓取（在线程池中并发执行）。
-            被阶段 2 的 ThreadPoolExecutor 调用。
+                # 检查是否已有缓存以避免不必要的网络请求和防反爬拦截
+                cid = str(course.get("courseId", "") or course.get("id", ""))
+                with self._cache_lock:
+                    cached = self.tokens_cache.get(cid, {})
+                has_cache = all(cached.get(k) for k in ["openc", "workEnc", "examEnc", "enc", "t"])
+                
+                # 如果没有缓存且是首次扫描，使用 3.0 秒的防反爬安全延迟
+                if not has_cache and is_first_scan:
+                    time.sleep(3.0)
 
-            参数:
-                start_delay: 启动延迟（秒），用于错峰启动各线程，避免触发反爬。
-            """
-            nonlocal scanned
-            if start_delay > 0:
-                time.sleep(start_delay)
-
-            hws = self._get_homework_list(course, tokens)
-            exams = self._get_exam_list(course, tokens)
-
-            # 筛选未完成的任务（同时过滤已过截止时间的）
-            unfinished = []
-            for h in hws:
-                if _is_unfinished(h["status"]) and not _is_overdue(h.get("deadline", ""), hide_nd):
-                    unfinished.append(h)
-            for e in exams:
-                if _is_unfinished(e["status"]) and not _is_overdue(e.get("deadline", ""), hide_nd):
-                    unfinished.append(e)
-
-            with lock:
-                scanned += 1
-                title = course.get("title", "未知课程")
-                if unfinished:
-                    logger.info(f"[{scanned}/{pair_total}] {title} - 未完成: {len(unfinished)}项")
+                cooldown = cfg.get("token_cooldown", 60)
+                tokens = self.get_course_tokens(course, cooldown_sec=cooldown)
+                
+                # 检查是否成功获取 Token 且未被冷却
+                cid = str(course.get("courseId", "") or course.get("id", ""))
+                with self._cache_lock:
+                    cached = self.tokens_cache.get(cid, {})
+                
+                if tokens and tokens.get("workEnc") and tokens.get("examEnc") and "cooldown_until" not in cached:
+                    course_token_pairs.append((course, tokens))
                 else:
-                    logger.debug(f"[{scanned}/{pair_total}] {title} - 全部完成")
+                    failed_in_phase1.append(course)
 
-            # 线程内速率控制，避免集中请求触发反爬（即使有错峰，内部仍保留速率控制）
-            time.sleep(rate_limit_delay)
-            return unfinished
+                if (idx + 1) % 5 == 0 or idx == total_remaining - 1:
+                    logger.info(f"  [阶段1进度] {idx+1}/{total_remaining} 门课程，已获 Token: {len(course_token_pairs)} 门")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            # 错峰启动：第 i 个线程延迟 i * 2 秒启动，确保同一时间只有 1 个线程发起首次请求
-            for i, (course, tokens) in enumerate(course_token_pairs):
-                delay = i * 1.0  # 每个课程间隔 1 秒启动，兼顾速度和防反爬
-                future = executor.submit(_fetch_course_data, course, tokens, delay)
-                futures.append(future)
+            token_fetch_elapsed = time.time() - token_fetch_start
+            logger.info(
+                f"[阶段1完成] {len(course_token_pairs)}/{total_remaining} 门课程获 Token，"
+                f"耗时 {token_fetch_elapsed:.1f}s"
+            )
 
-            for f in futures:
+            if not course_token_pairs:
+                logger.warning("[阶段1] 没有任何课程获取到 Token，跳过阶段2")
+                remaining_courses = list(failed_in_phase1)
+                
+                if remaining_courses and round_idx < max_rounds:
+                    retry_wait = cfg.get("retry_round_wait", 30)
+                    logger.info(f"第 {round_idx} 轮扫描结束（全部未获取 Token）。等待 {retry_wait} 秒后开始下一轮...")
+                    for s in range(retry_wait, 0, -1):
+                        if progress_callback:
+                            progress_callback({
+                                "status": "wait",
+                                "phase": "round_retry",
+                                "remaining_seconds": s,
+                                "message": f"正在等待 {s} 秒后开始下一轮重试..."
+                            })
+                        time.sleep(1)
+                continue
+
+            # ================================================================
+            # 阶段间恢复期：等待 15 秒让 session 的请求配额重置，
+            # 避免阶段 2 的并发请求立即触发反爬。
+            # ================================================================
+            wait_time = 15
+            logger.info(f"[阶段间] 等待 {wait_time}s 让 session 请求配额恢复...")
+            for s in range(wait_time, 0, -1):
+                if progress_callback:
+                    progress_callback({
+                        "status": "wait",
+                        "phase": "recovery",
+                        "remaining_seconds": s,
+                        "message": f"等待 {s} 秒让 session 请求配额恢复..."
+                    })
+                time.sleep(1)
+            logger.info("[阶段间] 恢复完成，开始阶段2")
+
+            # ================================================================
+            # 阶段 2：并发获取作业/考试列表（错峰启动，避免突发请求）
+            # ================================================================
+            scanned = 0
+            pair_total = len(course_token_pairs)
+            lock = threading.Lock()
+            failed_courses_in_phase2 = []
+
+            def _fetch_course_data(course: dict, tokens: dict, start_delay: float = 0) -> dict:
+                nonlocal scanned
+                if start_delay > 0:
+                    time.sleep(start_delay)
+
+                cid = str(course.get("courseId", "") or course.get("id", ""))
+                is_blocked = False
+                hws = []
+                exams = []
                 try:
-                    result = f.result()
-                    if result:
-                        all_tasks.extend(result)
+                    hws = self._get_homework_list(course, tokens)
+                    exams = self._get_exam_list(course, tokens)
+                    
+                    with self._cache_lock:
+                        cached = self.tokens_cache.get(cid, {})
+                    if "cooldown_until" in cached:
+                        is_blocked = True
                 except Exception as e:
-                    logger.error(f"扫描课程线程异常: {e}")
+                    logger.error(f"获取课程 {course.get('title')} 的作业/考试列表异常: {e}")
+                    is_blocked = True
+
+                unfinished = []
+                if not is_blocked:
+                    for h in hws:
+                        if _is_unfinished(h["status"]) and not _is_overdue(h.get("deadline", ""), hide_nd):
+                            unfinished.append(h)
+                    for e in exams:
+                        if _is_unfinished(e["status"]) and not _is_overdue(e.get("deadline", ""), hide_nd):
+                            unfinished.append(e)
+
+                with lock:
+                    scanned += 1
+                    title = course.get("title", "未知课程")
+                    if progress_callback:
+                        progress_callback({
+                            "status": "scanning",
+                            "phase": 2,
+                            "current": scanned,
+                            "total": pair_total,
+                            "message": f"已扫描 {scanned}/{pair_total} 门课程: {title}"
+                        })
+
+                    if is_blocked:
+                        logger.warning(f"[{scanned}/{pair_total}] {title} - 被反爬拦截或出错，将放入下一轮重试")
+                    else:
+                        if unfinished:
+                            logger.info(f"[{scanned}/{pair_total}] {title} - 未完成: {len(unfinished)}项")
+                        else:
+                            logger.debug(f"[{scanned}/{pair_total}] {title} - 全部完成")
+
+                time.sleep(rate_limit_delay)
+                return {"tasks": unfinished, "is_blocked": is_blocked}
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for i, (course, tokens) in enumerate(course_token_pairs):
+                    delay = i * 1.0
+                    future = executor.submit(_fetch_course_data, course, tokens, delay)
+                    futures.append((future, course))
+
+                for f, course in futures:
+                    try:
+                        res = f.result()
+                        if res["is_blocked"]:
+                            failed_courses_in_phase2.append(course)
+                        else:
+                            all_tasks.extend(res["tasks"])
+                    except Exception as e:
+                        logger.error(f"扫描课程 {course.get('title')} 线程异常: {e}")
+                        failed_courses_in_phase2.append(course)
+
+            remaining_courses = failed_in_phase1 + failed_courses_in_phase2
+            
+            if remaining_courses and round_idx < max_rounds:
+                retry_wait = cfg.get("retry_round_wait", 30)
+                logger.info(f"第 {round_idx} 轮扫描结束。有 {len(remaining_courses)} 门课程需要重试，等待 {retry_wait} 秒后开始下一轮...")
+                for s in range(retry_wait, 0, -1):
+                    if progress_callback:
+                        progress_callback({
+                            "status": "wait",
+                            "phase": "round_retry",
+                            "remaining_seconds": s,
+                            "message": f"有课程重试，等待 {s} 秒后开始下一轮..."
+                        })
+                    time.sleep(1)
 
         return all_tasks
 
