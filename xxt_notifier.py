@@ -1427,7 +1427,9 @@ def is_autostart_enabled() -> bool:
 def set_autostart(enable: bool) -> bool:
     """
     设置/取消开机自启。
-    enable=True：在注册表 Run 键中创建条目，指向 pythonw.exe -m xxt_gui
+    enable=True：在注册表 Run 键中创建条目
+    - 若以打包后的 exe 运行，则直接指向 exe
+    - 若以脚本运行，则指向 pythonw.exe 并传入 xxt_gui.py 的绝对路径
     enable=False：删除该注册表条目
     被 GUI 的自启开关点击时调用。
 
@@ -1438,15 +1440,24 @@ def set_autostart(enable: bool) -> bool:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE)
         try:
             if enable:
-                # pythonw.exe 路径（无控制台窗口）
-                pythonw = str(BASE_DIR / ".venv" / "Scripts" / "pythonw.exe")
-                if not Path(pythonw).exists():
-                    # 回退到 python.exe
-                    pythonw = str(BASE_DIR / ".venv" / "Scripts" / "python.exe")
-                args = "-m xxt_gui"
-                # 用引号括起路径，防止路径含空格时解析错误
-                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{pythonw}" {args}')
-                logger.info(f"开机自启已开启: {pythonw} {args}")
+                if getattr(sys, 'frozen', False):
+                    # 如果是打包后的可执行文件（PyInstaller），直接运行该 exe
+                    cmd = f'"{sys.executable}"'
+                else:
+                    # 如果是脚本运行，使用 pythonw.exe 运行 xxt_gui.py
+                    # 优先获取当前 Python 解释器同目录下的 pythonw.exe
+                    python_exe = Path(sys.executable)
+                    pythonw = python_exe.with_name("pythonw.exe")
+                    if not pythonw.exists():
+                        # 回退到当前 python 解释器
+                        pythonw = python_exe
+                    
+                    script_path = BASE_DIR / "xxt_gui.py"
+                    cmd = f'"{pythonw}" "{script_path}"'
+                
+                # 写入注册表 Run 键，用引号括起路径，防止路径含空格时解析错误
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+                logger.info(f"开机自启已开启: {cmd}")
             else:
                 try:
                     winreg.DeleteValue(key, _AUTOSTART_NAME)
