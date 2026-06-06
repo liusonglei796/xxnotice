@@ -131,10 +131,15 @@ class Switch(tk.Canvas):
 
     def _on_click(self, event):
         """点击切换状态"""
-        self._state = not self._state
-        self._draw()
+        new_state = not self._state
         if self._command:
-            self._command(self._state)
+            # 先执行回调，只有成功时才翻转视觉状态，避免失败时的闪烁回滚
+            result = self._command(new_state)
+            if result is False:
+                return  # 回调明确返回 False，保持原状态不动
+        # 回调成功（或没有回调），更新状态并重绘
+        self._state = new_state
+        self._draw()
 
     def set(self, state):
         """外部设置状态"""
@@ -1012,14 +1017,14 @@ class DashboardFrame(tk.Frame):
         self.render_current_tasks()
 
     def _on_autostart_toggle(self, state):
-        """滑动开关回调 — 设置开机自启状态"""
+        """滑动开关回调 — 设置开机自启状态，返回是否成功"""
         ok = set_autostart(state)
         if ok:
             self._autostart_on = state
             logger.info(f"[GUI] 开机自启已{'开启' if state else '关闭'}")
         else:
-            self.switch_autostart.set(not state)  # 回滚开关状态
             logger.error("[GUI] 设置开机自启失败")
+        return ok
 
     def quit_app(self):
         """完全退出应用"""
