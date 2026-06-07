@@ -1442,7 +1442,7 @@ def set_autostart(enable: bool) -> bool:
             if enable:
                 if getattr(sys, 'frozen', False):
                     # 如果是打包后的可执行文件（PyInstaller），直接运行该 exe
-                    cmd = f'"{sys.executable}"'
+                    cmd = f'"{sys.executable}" --minimized'
                 else:
                     # 如果是脚本运行，使用 pythonw.exe 运行 xxt_gui.py
                     # 优先获取当前 Python 解释器同目录下的 pythonw.exe
@@ -1453,7 +1453,7 @@ def set_autostart(enable: bool) -> bool:
                         pythonw = python_exe
                     
                     script_path = BASE_DIR / "xxt_gui.py"
-                    cmd = f'"{pythonw}" "{script_path}"'
+                    cmd = f'"{pythonw}" "{script_path}" --minimized'
                 
                 # 写入注册表 Run 键，用引号括起路径，防止路径含空格时解析错误
                 winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)

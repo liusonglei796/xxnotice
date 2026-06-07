@@ -1063,6 +1063,12 @@ def main():
 
     root = tk.Tk()
     app = XuexitongApp(root)
+
+    # --minimized: 开机自启时直接最小化到系统托盘，不显示主窗口
+    if "--minimized" in sys.argv:
+        root.withdraw()
+        logger.info("[GUI] 以 --minimized 启动，窗口已隐藏到系统托盘")
+
     root.mainloop()
 
 if __name__ == "__main__":
