@@ -31,6 +31,16 @@ import base64
 # 配置区
 # ============================================================
 
+# ============================================================
+# 版本号
+# ============================================================
+
+# 当前版本号 —— 每次发布新版本时更新此值，并在 GitHub 创建对应 Release
+CURRENT_VERSION = "1.0.0"
+
+# GitHub 仓库地址（用于检查更新）
+GITHUB_REPO = "liusonglei796/xxnotice"
+
 # 默认轮询间隔（秒），可由 config.json 的 poll_interval 覆盖
 POLL_INTERVAL = 300  # 5 分钟
 
@@ -1722,6 +1732,76 @@ def show_notification(title: str, message: str, tk_root=None):
     # 独立模式需要自己的 mainloop；GUI 模式下由主窗口 mainloop 驱动
     if standalone:
         popup.mainloop()
+
+
+def check_for_update(silent_fail=True, tk_root=None):
+    """
+    检查 GitHub Releases 是否有新版本发布。
+    通过请求 GitHub API 获取最新 Release 的 tag_name，与 CURRENT_VERSION 对比。
+    检测到新版本时弹出右下角通知提醒用户。
+
+    参数:
+        silent_fail: True 时网络错误不弹窗（后台静默检查）
+        tk_root: tkinter 根窗口，传入则用 Toplevel 通知（不阻塞）
+    """
+    import requests as _requests
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        resp = _requests.get(api_url, timeout=8, headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": f"xxnotice/{CURRENT_VERSION}"
+        })
+        if resp.status_code != 200:
+            if not silent_fail:
+                logger.warning(f"检查更新失败，HTTP {resp.status_code}")
+            return
+
+        data = resp.json()
+        latest_tag = data.get("tag_name", "")
+        release_name = data.get("name", latest_tag)
+        html_url = data.get("html_url", "")
+
+        # 去除 tag 的前缀 "v"（如 "v1.2.0" → "1.2.0"）
+        latest_version = latest_tag.lstrip("v").strip()
+        current = CURRENT_VERSION.strip()
+
+        if not latest_version or not current:
+            return
+
+        # 简单的版本比较：按 "." 分割后逐段比较数字
+        def _parse_version(v):
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except ValueError:
+                return (0,)
+
+        if _parse_version(latest_version) > _parse_version(current):
+            logger.info(f"检测到新版本: {latest_version}（当前: {current}）")
+            msg = f"最新版本: v{latest_version}"
+            if release_name and release_name != latest_tag:
+                msg += f" - {release_name}"
+            msg += f"\n当前版本: v{current}"
+            if html_url:
+                msg += f"\n前往下载: {html_url}"
+
+            def _show():
+                show_notification("发现新版本", msg, tk_root=tk_root)
+
+            # 在后台线程调用时，用 after() 调度到主线程，避免 Tkinter 线程安全问题
+            if tk_root is not None:
+                try:
+                    tk_root.after(0, _show)
+                except Exception:
+                    _show()
+            else:
+                _show()
+        else:
+            logger.debug(f"已是最新版本: v{current}")
+
+    except Exception as e:
+        if not silent_fail:
+            logger.warning(f"检查更新出错: {e}")
 
 
 def run_gui():

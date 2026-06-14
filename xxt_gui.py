@@ -4,6 +4,7 @@ from xxt_notifier import (
     XuexitongClient, load_config, save_config, setup_logging, logger,
     is_autostart_enabled, set_autostart,
     find_new_tasks, save_task_state, show_notification,
+    check_for_update, CURRENT_VERSION,
 )
 import threading
 import webbrowser
@@ -154,7 +155,7 @@ class Switch(tk.Canvas):
 class XuexitongApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("学习通作业/考试扫描器")
+        self.root.title(f"学习通作业/考试扫描器 v{CURRENT_VERSION}")
         self.root.geometry("850x650")
         self.root.configure(bg=THEME["bg"])
         
@@ -1063,6 +1064,12 @@ def main():
 
     root = tk.Tk()
     app = XuexitongApp(root)
+
+    # 启动后延迟 3 秒，在后台线程检查 GitHub 是否有新版本
+    def _check_update_bg():
+        check_for_update(silent_fail=True, tk_root=root)
+
+    root.after(3000, lambda: threading.Thread(target=_check_update_bg, daemon=True).start())
 
     # --minimized: 开机自启时直接最小化到系统托盘，不显示主窗口
     if "--minimized" in sys.argv:
