@@ -653,6 +653,30 @@ class XuexitongClient:
             logger.warning(f"登录失败: {msg}")
             return False
 
+    def _try_auto_relogin(self) -> bool:
+        """
+        尝试从配置文件加载账号密码并进行自动登录，成功后保存新 Cookie
+        """
+        try:
+            config = load_config()
+            phone = config.get("phone")
+            password = config.get("password")
+            if phone and password:
+                logger.info(f"检测到 Cookie 失效，正在尝试使用保存的账号 {phone} 重新登录以自动刷新...")
+                if self.login(phone, password):
+                    new_cookies = self.get_cookies()
+                    config["cookies"] = new_cookies
+                    save_config(config)
+                    logger.info("自动重新登录成功，已保存新 Cookie 到配置文件")
+                    return True
+                else:
+                    logger.warning("自动重新登录失败：用户名或密码错误，或触发了人机验证")
+            else:
+                logger.warning("自动重新登录失败：未在配置中找到手机号或密码")
+        except Exception as e:
+            logger.error(f"自动重新登录时发生异常: {e}")
+        return False
+
     def load_cookies(self, cookie_list: list) -> bool:
         """从 cookie 列表加载已保存的 cookies（每个元素含 name/value/domain/path）"""
         for c in cookie_list:
