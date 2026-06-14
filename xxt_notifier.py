@@ -662,7 +662,8 @@ class XuexitongClient:
             phone = config.get("phone")
             password = config.get("password")
             if phone and password:
-                logger.info(f"检测到 Cookie 失效，正在尝试使用保存的账号 {phone} 重新登录以自动刷新...")
+                masked_phone = f"{phone[:3]}****{phone[-4:]}" if len(phone) >= 7 else phone
+                logger.info(f"检测到 Cookie 失效，正在尝试使用保存的账号 {masked_phone} 重新登录以自动刷新...")
                 if self.login(phone, password):
                     new_cookies = self.get_cookies()
                     config["cookies"] = new_cookies
@@ -673,8 +674,8 @@ class XuexitongClient:
                     logger.warning("自动重新登录失败：用户名或密码错误，或触发了人机验证")
             else:
                 logger.warning("自动重新登录失败：未在配置中找到手机号或密码")
-        except Exception as e:
-            logger.error(f"自动重新登录时发生异常: {e}")
+        except Exception:
+            logger.exception("自动重新登录时发生异常")
         return False
 
     def load_cookies(self, cookie_list: list) -> bool:
@@ -748,15 +749,38 @@ class XuexitongClient:
             **HEADERS,
             "Referer": "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/interaction",
         }
-        try:
-            resp = self.session.post(COURSE_LIST_URL, data=data, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                html = resp.content.decode('utf-8', errors='ignore')
-                courses = parse_courses_from_html(html)
-                logger.info(f"获取到 {len(courses)} 门课程")
-                return courses
-        except Exception as e:
-            logger.warning(f"课程列表请求失败: {e}")
+        
+        # 最多尝试 2 次（第一次使用现有 Cookie，失效时尝试自动登录并重试一次）
+        for attempt in range(2):
+            try:
+                resp = self.session.post(COURSE_LIST_URL, data=data, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    html = resp.content.decode('utf-8', errors='ignore')
+                    
+                    # 检查是否被重定向到登录页，或者 HTML 包含登录关键字且未匹配到课程
+                    is_login_page = "passport" in resp.url or "login" in resp.url or "登录" in html
+                    courses = parse_courses_from_html(html)
+                    
+                    if not courses and is_login_page:
+                        logger.info("检测到 Cookie 已过期/失效")
+                        if attempt == 0 and self._try_auto_relogin():
+                            logger.info("自动刷新 Cookie 成功，正在重试获取课程列表...")
+                            continue # 重试
+                        else:
+                            logger.warning("无法通过自动登录刷新 Cookie，获取课程列表失败")
+                            return []
+                    
+                    logger.info(f"获取到 {len(courses)} 门课程")
+                    return courses
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                logger.warning(f"课程列表网络请求失败/超时 (尝试 {attempt+1}/2): {e}")
+                # 直接重试，不执行自动重新登录
+            except Exception as e:
+                logger.warning(f"课程列表请求失败 (尝试 {attempt+1}/2): {e}")
+                if attempt == 0 and self._try_auto_relogin():
+                    logger.info("自动刷新 Cookie 成功，正在重试获取课程列表...")
+                    continue
+                
         return []
 
     def _set_course_cooldown(self, course_id: str, cooldown_sec: int = 60):
