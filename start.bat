@@ -1,4 +1,4 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-start /b .venv\Scripts\pythonw.exe -m xxt_gui --minimized
+start "" .venv\Scripts\pythonw.exe -m xxt_gui
