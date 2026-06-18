@@ -1,5 +1,8 @@
 # 学习通扫描器 (xxnotice)
 
+[![GitHub Release](https://img.shields.io/github/v/release/liusonglei796/xxnotice?style=flat-square)](https://github.com/liusonglei796/xxnotice/releases)
+[![Downloads](https://img.shields.io/github/downloads/liusonglei796/xxnotice/total?style=flat-square)](https://github.com/liusonglei796/xxnotice/releases)
+
 超星学习通（泛雅平台）未完成作业/考试自动扫描与桌面通知工具。
 
 ## 功能
@@ -16,7 +19,20 @@
 - **Cookie 自动无感刷新**：Cookie 过期后，若配置了账号密码，系统将在后台自动重新登录并刷新 Cookie，保证长期无人值守运行
 - **开机自启动**：内置开关控制是否开机自动运行
 
-## 安装
+## 下载
+
+### 编译版（推荐，无需 Python 环境）
+
+从 [GitHub Releases](https://github.com/liusonglei796/xxnotice/releases) 下载最新版 `xxnotice-scanner.exe`，直接双击运行即可。
+
+**首次使用流程**：
+1. 下载 `xxnotice-scanner.exe` 并双击运行
+2. 使用**学习通 App 扫码登录**（推荐）或输入**手机号 + 密码**登录
+3. 登录成功后自动开始扫描，有新作业时会弹出系统通知
+
+> 编译版已包含所有依赖和 Python 运行时，无需额外安装任何东西。
+
+## 从源码运行
 
 ### 1. 安装 Python 3.9+
 
@@ -110,6 +126,8 @@ xxnotice/
 ├── requirements.txt    # Python 依赖
 ├── start.bat           # Windows 一键启动脚本
 ├── test_antispider.py  # 反爬策略测试工具
+├── build_exe.py        # PyInstaller 编译脚本
+├── dist/               # 编译输出目录（含 .exe）
 └── .gitignore
 ```
 

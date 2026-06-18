@@ -1492,13 +1492,23 @@ def load_task_state() -> dict:
                 data["baseline_notice_ids"] = []
             if "cutoff_timestamp" not in data:
                 data["cutoff_timestamp"] = None
+            if "unread_task_keys" not in data:
+                data["unread_task_keys"] = {}  # dict of {task_key: timestamp}
+            if "unread_notice_ids" not in data:
+                data["unread_notice_ids"] = []  # list of notice idCodes
             return data
     except Exception as e:
         logger.warning(f"加载 state.json 失败: {e}")
-    return {"seen_keys": [], "seen_notice_ids": [], "hidden_notice_ids": [], "baseline_notice_ids": [], "cutoff_timestamp": None}
+    return {"seen_keys": [], "seen_notice_ids": [], "hidden_notice_ids": [], "baseline_notice_ids": [], "cutoff_timestamp": None, "unread_task_keys": {}, "unread_notice_ids": []}
 
 
-def save_task_state(tasks: list, notice_count: Optional[int] = None, seen_notice_ids: Optional[list] = None, hidden_notice_ids: Optional[list] = None, baseline_notice_ids: Optional[list] = None, cutoff_timestamp: Optional[int] = None):
+def save_task_state(tasks: list, notice_count: Optional[int] = None,
+                    seen_notice_ids: Optional[list] = None,
+                    hidden_notice_ids: Optional[list] = None,
+                    baseline_notice_ids: Optional[list] = None,
+                    cutoff_timestamp: Optional[int] = None,
+                    unread_task_keys: Optional[dict] = None,
+                    unread_notice_ids: Optional[list] = None):
     """
     将当前任务列表、通知数量和已见通知 IDs 写入 state.json。
     seen_keys 累积保存（旧 key 保留 + 新 key 追加），避免重复通知。
@@ -1556,12 +1566,68 @@ def save_task_state(tasks: list, notice_count: Optional[int] = None, seen_notice
         else:
             state["cutoff_timestamp"] = None
 
+        if unread_task_keys is not None:
+            old_unread = old.get("unread_task_keys", {})
+            old_unread.update(unread_task_keys)
+            state["unread_task_keys"] = old_unread
+        elif "unread_task_keys" in old:
+            state["unread_task_keys"] = old["unread_task_keys"]
+        else:
+            state["unread_task_keys"] = {}
+
+        if unread_notice_ids is not None:
+            old_notice_unread = set(old.get("unread_notice_ids", []))
+            old_notice_unread.update(unread_notice_ids)
+            state["unread_notice_ids"] = sorted(old_notice_unread)
+        elif "unread_notice_ids" in old:
+            state["unread_notice_ids"] = old["unread_notice_ids"]
+        else:
+            state["unread_notice_ids"] = []
+
         STATE_FILE.write_text(
             json.dumps(state, ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
     except Exception as e:
         logger.warning(f"保存 state.json 失败: {e}")
+
+
+def mark_task_read(task_key: str) -> dict:
+    """Mark a single task as read (remove from unread_task_keys).
+    Returns the updated state dict.
+    Called from GUI when user clicks '标为已读' on a task card."""
+    state = load_task_state()
+    unread = state.get("unread_task_keys", {})
+    if task_key in unread:
+        del unread[task_key]
+        state["unread_task_keys"] = unread
+        try:
+            STATE_FILE.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"保存已读状态失败: {e}")
+    return state
+
+
+def mark_notice_read(notice_id: str) -> dict:
+    """Mark a single notice as read (remove from unread_notice_ids).
+    Returns the updated state dict.
+    Called from GUI when user clicks '标为已读' on a notice card."""
+    state = load_task_state()
+    unread = state.get("unread_notice_ids", [])
+    if notice_id in unread:
+        unread = [nid for nid in unread if nid != notice_id]
+        state["unread_notice_ids"] = unread
+        try:
+            STATE_FILE.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning(f"保存通知已读状态失败: {e}")
+    return state
 
 
 def _is_unfinished(status: str) -> bool:
