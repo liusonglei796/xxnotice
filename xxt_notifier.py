@@ -13,9 +13,14 @@ import json
 import time
 import re
 import sys
+import os
 import logging
+import logging.handlers
 import threading
+import hashlib
 import winreg  # Windows 注册表操作（用于开机自启管理）
+import ctypes
+from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html.parser import HTMLParser
@@ -84,6 +89,25 @@ CONFIG_FILE = BASE_DIR / "config.json"
 # 全局日志记录器
 LOG_FILE = BASE_DIR / "xxt_notifier.log"
 
+class SensitiveDataFilter(logging.Filter):
+    """
+    日志敏感信息过滤：在写入文件前自动脱敏。
+    覆盖电话、UID、token 等敏感数据。
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.msg)
+        # 脱敏电话号码模式：176****9070 → ****9070
+        msg = re.sub(r'\d{3}\*{4}\d{4}', '****', msg)
+        # 脱敏完整手机号
+        msg = re.sub(r'\b1[3-9]\d{9}\b', '***********', msg)
+        # 脱敏 UID
+        msg = re.sub(r'_uid[=:]\s*(\d+)', '_uid=***', msg)
+        # 脱敏 Token 类值
+        msg = re.sub(r'(token|enc)\s*[=:]\s*\S{8,}', r'\1=***', msg)
+        record.msg = msg
+        return True
+
+
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
     """
     配置日志系统：同时输出到控制台和文件 xxt_notifier.log
@@ -95,19 +119,27 @@ def setup_logging(level: int = logging.INFO) -> logging.Logger:
         return logger
     logger.setLevel(level)
 
-    # 文件处理器（UTF-8，保留详细日志）
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # 敏感信息过滤器
+    _filter = SensitiveDataFilter()
+
+    # 文件处理器（UTF-8，带轮转，最大 10MB，保留 3 个备份）
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3,
+        encoding="utf-8",
+    )
     fh.setLevel(level)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
+    fh.addFilter(_filter)
     logger.addHandler(fh)
 
     # 控制台处理器（简单格式，无时间戳）
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
     ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    ch.addFilter(_filter)
     logger.addHandler(ch)
 
     return logger
@@ -150,6 +182,83 @@ def aes_encrypt(plaintext: str) -> str:
     padded = pad(plaintext.encode("utf-8"), AES.block_size)
     encrypted = cipher.encrypt(padded)
     return base64.b64encode(encrypted).decode("utf-8")
+
+
+# ============================================================
+# Windows DPAPI 加解密工具
+# ============================================================
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def _DPAPI_encrypt(plaintext: str) -> str:
+    """
+    使用 Windows DPAPI (CryptProtectData) 加密字符串。
+    输出 Base64 编码密文，仅当前 Windows 用户可解密。
+    返回空字符串表示失败（如非 Windows 环境）。
+    """
+    if not plaintext:
+        return ""
+    try:
+        data = plaintext.encode("utf-16-le")
+        blob_in = _DATA_BLOB(
+            len(data),
+            ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_byte)),
+        )
+        blob_out = _DATA_BLOB()
+        if ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+        ):
+            raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return base64.b64encode(raw).decode()
+    except Exception:
+        pass
+    return ""
+
+
+def _DPAPI_decrypt(ciphertext_b64: str) -> str:
+    """
+    使用 Windows DPAPI (CryptUnprotectData) 解密 Base64 密文。
+    返回原始字符串。解密失败返回空字符串（非 DPAPI 数据/不同用户/不同机器）。
+    """
+    if not ciphertext_b64:
+        return ""
+    try:
+        raw = base64.b64decode(ciphertext_b64)
+        blob_in = _DATA_BLOB(
+            len(raw),
+            ctypes.cast(ctypes.create_string_buffer(raw), ctypes.POINTER(ctypes.c_byte)),
+        )
+        blob_out = _DATA_BLOB()
+        if ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+        ):
+            result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+            return result.decode("utf-16-le")
+    except Exception:
+        pass
+    return ""
+
+
+_DPAPI_PREFIX = "__DPAPI__"
+
+
+def _is_dpapi_encrypted(value) -> bool:
+    """Check if a value starts with the DPAPI sentinel prefix."""
+    return isinstance(value, str) and value.startswith(_DPAPI_PREFIX)
+
+
+def _tag_encrypted(value: str) -> str:
+    """Wrap encrypted base64 with sentinel prefix."""
+    return _DPAPI_PREFIX + value
+
+
+def _untag_encrypted(value: str) -> str:
+    """Strip sentinel prefix from encrypted value."""
+    return value[len(_DPAPI_PREFIX):]
 
 
 # ============================================================
@@ -489,14 +598,25 @@ class XuexitongClient:
     def load_tokens_cache(self):
         try:
             if self.tokens_cache_file.exists():
-                with open(self.tokens_cache_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict) and "uid" in data and "tokens" in data:
-                        self._cache_uid = data.get("uid")
-                        self.tokens_cache = data.get("tokens", {})
+                raw = self.tokens_cache_file.read_text(encoding="utf-8")
+                data = json.loads(raw)
+
+                # 检测并解密 DPAPI 加密的缓存
+                if isinstance(data, dict) and "uid" in data and "tokens" in data:
+                    self._cache_uid = data.get("uid")
+                    tokens_raw = data.get("tokens", {})
+                elif isinstance(data, str) and _is_dpapi_encrypted(data):
+                    decrypted = _DPAPI_decrypt(_untag_encrypted(data))
+                    if decrypted:
+                        decrypted_data = json.loads(decrypted)
+                        self._cache_uid = decrypted_data.get("uid", "")
+                        tokens_raw = decrypted_data.get("tokens", {})
                     else:
-                        self._cache_uid = None
-                        self.tokens_cache = data if isinstance(data, dict) else {}
+                        raise ValueError("DPAPI解密失败")
+                else:
+                    self._cache_uid = None
+                    tokens_raw = data if isinstance(data, dict) else {}
+                self.tokens_cache = tokens_raw if isinstance(tokens_raw, dict) else {}
         except Exception as e:
             logger.warning(f"加载Token缓存失败: {e}")
             self.tokens_cache = {}
@@ -508,8 +628,19 @@ class XuexitongClient:
                 "uid": self._uid,
                 "tokens": self.tokens_cache
             }
-            with open(self.tokens_cache_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            # DPAPI 加密整个数据块
+            encrypted = _DPAPI_encrypt(json.dumps(data, ensure_ascii=False))
+            if encrypted:
+                self.tokens_cache_file.write_text(
+                    json.dumps(_tag_encrypted(encrypted), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            else:
+                # 回退：不加密写入（非 Windows 环境）
+                with open(self.tokens_cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            # 限制文件权限
+            _restrict_file_permissions(self.tokens_cache_file)
         except Exception as e:
             logger.warning(f"保存Token缓存失败: {e}")
 
@@ -1682,6 +1813,63 @@ def _is_overdue(deadline: str, hide_no_deadline: bool = False) -> bool:
 
 
 
+def _restrict_file_permissions(path: Path):
+    """
+    通过 Windows icacls 将文件权限限制为仅当前用户可访问。
+    移除所有继承权限，只保留当前用户的完全控制权。
+    静默忽略错误（非 Windows / 无 icacls）。
+    """
+    try:
+        username = os.environ.get("USERNAME", "")
+        if username:
+            import subprocess
+            subprocess.run(
+                ["icacls", str(path), "/inheritance:r", "/grant", f"{username}:F"],
+                capture_output=True, timeout=10,
+            )
+    except Exception:
+        pass
+
+
+def _encrypt_config_sensitive(config: dict):
+    """Encrypt sensitive fields in config before writing to disk."""
+    # Encrypt password
+    pwd = config.get("password")
+    if pwd and not _is_dpapi_encrypted(pwd):
+        encrypted = _DPAPI_encrypt(pwd)
+        if encrypted:
+            config["password"] = _tag_encrypted(encrypted)
+
+    # Encrypt cookies (serialize list to JSON, then encrypt)
+    cookies = config.get("cookies")
+    if isinstance(cookies, list) and cookies:
+        encrypted = _DPAPI_encrypt(json.dumps(cookies, ensure_ascii=False))
+        if encrypted:
+            config["cookies"] = _tag_encrypted(encrypted)
+
+    return config
+
+
+def _decrypt_config_sensitive(config: dict):
+    """Decrypt sensitive fields in config after reading from disk."""
+    pwd = config.get("password")
+    if _is_dpapi_encrypted(pwd):
+        decrypted = _DPAPI_decrypt(_untag_encrypted(pwd))
+        if decrypted:
+            config["password"] = decrypted
+
+    cookies = config.get("cookies")
+    if _is_dpapi_encrypted(cookies):
+        decrypted = _DPAPI_decrypt(_untag_encrypted(cookies))
+        if decrypted:
+            try:
+                config["cookies"] = json.loads(decrypted)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return config
+
+
 def load_config() -> dict:
     """
     加载配置文件，与 DEFAULT_CONFIG 合并（用户配置优先覆盖默认值）
@@ -1695,6 +1883,11 @@ def load_config() -> dict:
                 config.update(user_config)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"加载 config.json 失败，使用默认配置: {e}")
+
+    # 解密敏感字段（兼容新旧格式）
+    config = _decrypt_config_sensitive(config)
+    # 确保敏感文件权限正确
+    _restrict_file_permissions(CONFIG_FILE)
     return config
 
 
@@ -1712,7 +1905,11 @@ def save_config(config: dict):
                 config = existing
         except (json.JSONDecodeError, OSError):
             pass
+
+    # 加密敏感字段后再写入
+    config = _encrypt_config_sensitive(config)
     CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    _restrict_file_permissions(CONFIG_FILE)
 
 
 # ============================================================
@@ -1723,6 +1920,7 @@ def save_config(config: dict):
 _AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 # 注册表中的条目名称
 _AUTOSTART_NAME = "XuexitongNotifier"
+_AUTOSTART_HASH_NAME = "XuexitongNotifierHash"  # SHA-256 完整性校验
 
 
 def is_autostart_enabled() -> bool:
@@ -1750,7 +1948,8 @@ def set_autostart(enable: bool) -> bool:
     enable=True：在注册表 Run 键中创建条目
     - 若以打包后的 exe 运行，则直接指向 exe
     - 若以脚本运行，则指向 pythonw.exe 并传入 xxt_gui.py 的绝对路径
-    enable=False：删除该注册表条目
+    同时存储目标文件的 SHA-256 哈希用于完整性校验。
+    enable=False：删除该注册表条目及其哈希值。
     被 GUI 的自启开关点击时调用。
 
     使用 pythonw.exe 而非 python.exe，避免开机启动时弹出控制台窗口。
@@ -1763,6 +1962,7 @@ def set_autostart(enable: bool) -> bool:
                 if getattr(sys, 'frozen', False):
                     # 如果是打包后的可执行文件（PyInstaller），直接运行该 exe
                     cmd = f'"{sys.executable}" --minimized'
+                    target_path = sys.executable
                 else:
                     # 如果是脚本运行，使用 pythonw.exe 运行 xxt_gui.py
                     # 优先获取当前 Python 解释器同目录下的 pythonw.exe
@@ -1774,22 +1974,69 @@ def set_autostart(enable: bool) -> bool:
                     
                     script_path = BASE_DIR / "xxt_gui.py"
                     cmd = f'"{pythonw}" "{script_path}" --minimized'
+                    target_path = str(script_path)
                 
                 # 写入注册表 Run 键，用引号括起路径，防止路径含空格时解析错误
                 winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+                # 存储目标文件的 SHA-256 哈希用于完整性校验
+                try:
+                    if os.path.isfile(target_path):
+                        file_hash = hashlib.sha256(
+                            open(target_path, "rb").read()
+                        ).hexdigest()
+                        winreg.SetValueEx(key, _AUTOSTART_HASH_NAME, 0, winreg.REG_SZ, file_hash)
+                except Exception:
+                    pass
                 logger.info(f"开机自启已开启: {cmd}")
             else:
                 try:
                     winreg.DeleteValue(key, _AUTOSTART_NAME)
-                    logger.info("开机自启已关闭")
                 except FileNotFoundError:
-                    pass  # 本来就没有条目
+                    pass
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_HASH_NAME)
+                except FileNotFoundError:
+                    pass
+                logger.info("开机自启已关闭")
             return True
         finally:
             winreg.CloseKey(key)
     except Exception as e:
         logger.error(f"设置开机自启失败: {e}")
         return False
+
+
+def verify_autostart_integrity() -> bool:
+    """
+    校验开机自启目标文件的 SHA-256 哈希是否与注册表中存储的一致。
+    如果不一致，说明文件可能被篡改或已更新（需重新开源自启）。
+    仅用于日志警告，不阻止程序启动。
+    返回 True 表示一致或无需校验，False 表示不一致。
+    """
+    if not is_autostart_enabled():
+        return True
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_READ)
+        try:
+            stored_hash, _ = winreg.QueryValueEx(key, _AUTOSTART_HASH_NAME)
+            target = sys.executable if getattr(sys, 'frozen', False) else str(BASE_DIR / "xxt_gui.py")
+            if os.path.isfile(target):
+                current_hash = hashlib.sha256(
+                    open(target, "rb").read()
+                ).hexdigest()
+                if current_hash != stored_hash:
+                    logger.warning(
+                        "开机自启完整性校验失败：文件哈希与注册表记录不一致。"
+                        "如果文件已更新，请重新开启自启以更新哈希。"
+                    )
+                    return False
+        except FileNotFoundError:
+            pass  # 旧版本没有存储哈希，跳过
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        pass
+    return True
 
 
 # ============================================================

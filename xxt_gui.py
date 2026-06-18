@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from xxt_notifier import (
     XuexitongClient, load_config, save_config, setup_logging, logger,
-    is_autostart_enabled, set_autostart,
+    is_autostart_enabled, set_autostart, verify_autostart_integrity,
     load_task_state, save_task_state,
     find_new_tasks, show_notification,
     mark_notice_read, extract_notices,
@@ -714,6 +714,9 @@ class DashboardFrame(tk.Frame):
             command=self._on_autostart_toggle
         )
         self.switch_autostart.pack(side="right", padx=(10, 0))
+
+        # 开机自启完整性校验（非阻塞，仅日志警告）
+        verify_autostart_integrity()
         
         # Logout Button
         self.btn_logout = tk.Button(header, text="退出登录", bg=THEME["fg_muted"], fg=THEME["fg"],
@@ -899,9 +902,56 @@ class DashboardFrame(tk.Frame):
             self.lbl_notice_count.configure(text=f"({unread_notice_count})")
 
             if "last_notice_count" not in state:
-                # 首次获取通知数：静默建立基线
-                logger.info(f"[GUI] 首次获取通知数，静默建立基线: {notice_count}")
-                save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids, cutoff_timestamp=cutoff_timestamp)
+                # 首次获取通知数：通知用户现有的未读通知
+                logger.info(f"[GUI] 首次获取通知数: {notice_count}")
+                # Treat all current unread notices as new
+                seen_notice_ids = set(state.get("seen_notice_ids", []))
+                new_unread_notices = []
+                for item in fetched_notices:
+                    id_code = item.get("idCode")
+                    if id_code and id_code not in seen_notice_ids and item.get("isread") == 0 and item.get("insertTime", 0) >= cutoff_timestamp:
+                        new_unread_notices.append(item)
+                if new_unread_notices:
+                    for item in new_unread_notices[:3]:
+                        creater = item.get("createrName") or "未知发送人"
+                        title = item.get("title") or "无标题通知"
+                        import time
+                        insert_time = item.get("insertTime", 0)
+                        time_str = "未知时间"
+                        if insert_time:
+                            try:
+                                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(insert_time / 1000))
+                            except Exception:
+                                pass
+                        content_body = ""
+                        notice_id = item.get("uuid") or item.get("idCode")
+                        if notice_id:
+                            send_tag = str(item.get("sendTag", "0"))
+                            try:
+                                detail_res = self.controller.client.get_notice_detail(notice_id, send_tag)
+                                if detail_res.get("status") == True:
+                                    msg_data = detail_res.get("msg", {})
+                                    if isinstance(msg_data, dict):
+                                        raw_content = msg_data.get("content", "")
+                                        if raw_content:
+                                            import html, re
+                                            unescaped = html.unescape(raw_content)
+                                            content_body = re.sub(r'\s+', ' ', unescaped).strip()
+                                            if len(content_body) > 100:
+                                                content_body = content_body[:97] + "..."
+                            except Exception:
+                                pass
+                        msg_text = f"发件人：{creater}\n标题：{title}\n时间：{time_str}"
+                        if content_body:
+                            msg_text += f"\n内容：{content_body}"
+                        show_notification("🔔 收件箱新通知", msg_text, tk_root=root)
+                    if len(new_unread_notices) > 3:
+                        show_notification("🔔 更多新通知", f"还有 {len(new_unread_notices)-3} 个新通知未查看", tk_root=root)
+                    has_new_notice = True
+                    new_unread_ids = [n.get("idCode") for n in new_unread_notices if n.get("idCode")]
+                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids, unread_notice_ids=new_unread_ids, cutoff_timestamp=cutoff_timestamp)
+                else:
+                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids, cutoff_timestamp=cutoff_timestamp)
             else:
                 last_notice_count = state["last_notice_count"]
                 seen_notice_ids = set(state.get("seen_notice_ids", []))
@@ -1000,39 +1050,26 @@ class DashboardFrame(tk.Frame):
         self.render_current_tasks()
 
         # ===== 检测新任务 → 弹窗通知 =====
-        is_first_run = not state.get("seen_keys")
-
-        if is_first_run:
-            # 首次运行：静默建立基线，不弹新任务通知
-            # manual 时仍弹一个"完成"提示
-            logger.info("[GUI] 首次运行（无 seen_keys），静默建立任务基线")
-            if manual:
+        new_tasks = find_new_tasks(self.tasks_list)
+        if new_tasks:
+            for nt in new_tasks[:3]:
+                teacher = nt.get("teacher", "") or nt.get("course", "")
+                type_label = nt.get("type", "任务")
                 show_notification(
-                    "📋 首次扫描完成",
-                    "已建立任务基线，下次发布新作业时会弹窗提醒你",
+                    f"📚 新{type_label}：{nt.get('course', '')}",
+                    f"老师：{teacher}\n作业：{nt.get('name', '')}\n截止：{nt.get('deadline', '未设置')}",
                     tk_root=root
                 )
-        else:
-            new_tasks = find_new_tasks(self.tasks_list)
-            if new_tasks:
-                for nt in new_tasks[:3]:
-                    teacher = nt.get("teacher", "") or nt.get("course", "")
-                    type_label = nt.get("type", "任务")
-                    show_notification(
-                        f"📚 新{type_label}：{nt.get('course', '')}",
-                        f"老师：{teacher}\n作业：{nt.get('name', '')}\n截止：{nt.get('deadline', '未设置')}",
-                        tk_root=root
-                    )
-                if len(new_tasks) > 3:
-                    show_notification("📚 更多新任务", f"还有 {len(new_tasks)-3} 个新任务未查看", tk_root=root)
-            elif manual and not has_new_notice:
-                # 手动刷新且没有新任务也无新通知：弹完成通知，避免点了刷新没反应
-                show_notification(
-                    "✅ 扫描完成",
-                    "没有新发布的作业或考试",
-                    tk_root=root
-                )
-            # 自动轮询且无新任务 → 不弹窗，静默更新
+            if len(new_tasks) > 3:
+                show_notification("📚 更多新任务", f"还有 {len(new_tasks)-3} 个新任务未查看", tk_root=root)
+        elif manual and not has_new_notice:
+            # 手动刷新且没有新任务也无新通知：弹完成通知，避免点了刷新没反应
+            show_notification(
+                "✅ 扫描完成",
+                "没有新发布的作业或考试",
+                tk_root=root
+            )
+        # 自动轮询且无新任务 → 不弹窗，静默更新
 
         # ===== 持久未读提醒：自动轮询时检查是否有未确认的通知 =====
         if not manual:
