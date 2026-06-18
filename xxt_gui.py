@@ -3,7 +3,9 @@ from tkinter import messagebox
 from xxt_notifier import (
     XuexitongClient, load_config, save_config, setup_logging, logger,
     is_autostart_enabled, set_autostart,
-    find_new_tasks, save_task_state, show_notification,
+    load_task_state, save_task_state,
+    find_new_tasks, show_notification,
+    mark_notice_read, extract_notices,
     check_for_update, CURRENT_VERSION,
 )
 import threading
@@ -741,14 +743,14 @@ class DashboardFrame(tk.Frame):
                                        command=lambda: self.switch_tab("通知"))
         self.btn_tab_notice.pack(side="left", padx=(10, 0), ipady=6)
         
-        # Task count badges
-        self.lbl_hw_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["badge_hw"], font=("Microsoft YaHei", 10, "bold"))
+        # Task unread count badges (red accent for unread)
+        self.lbl_hw_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["error"], font=("Microsoft YaHei", 10, "bold"))
         self.lbl_hw_count.pack(side="left", padx=(0, 0))
         
-        self.lbl_exam_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["badge_exam"], font=("Microsoft YaHei", 10, "bold"))
+        self.lbl_exam_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["error"], font=("Microsoft YaHei", 10, "bold"))
         self.lbl_exam_count.pack(side="left", padx=(5, 0))
 
-        self.lbl_notice_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["success"], font=("Microsoft YaHei", 10, "bold"))
+        self.lbl_notice_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["error"], font=("Microsoft YaHei", 10, "bold"))
         self.lbl_notice_count.pack(side="left", padx=(5, 0))
 
         # Loading Indicator Label
@@ -766,6 +768,37 @@ class DashboardFrame(tk.Frame):
         """安排下一次后台轮询（每 poll_interval 秒自动刷新一次）。"""
         poll_ms = self.controller.config.get("poll_interval", 300) * 1000
         self._poll_job_id = self.after(poll_ms, self.fetch_and_render)
+
+    def _update_unread_badges(self):
+        """Update the notification tab badge showing unread count from state."""
+        state = load_task_state()
+        unread_ids = set(state.get("unread_notice_ids", []))
+        cutoff_ts = state.get("cutoff_timestamp", 0) or 0
+        hidden_ids = set(state.get("hidden_notice_ids", []))
+        count = sum(1 for n in getattr(self, 'notices_list', [])
+                    if (n.get("idCode") or "") in unread_ids
+                    and n.get("insertTime", 0) >= cutoff_ts
+                    and n.get("idCode") not in hidden_ids)
+        self.lbl_notice_count.configure(text=f"({count})" if count else "")
+
+    def _check_unread_reminder(self, root):
+        """Check if there are unacknowledged notices and show a persistent reminder.
+        Called after each automatic poll cycle."""
+        state = load_task_state()
+        unread_ids = set(state.get("unread_notice_ids", []))
+        cutoff_ts = state.get("cutoff_timestamp", 0) or 0
+        hidden_ids = set(state.get("hidden_notice_ids", []))
+        # Count visible notices that are still in unread set
+        count = sum(1 for n in getattr(self, 'notices_list', [])
+                    if (n.get("idCode") or "") in unread_ids
+                    and n.get("insertTime", 0) >= cutoff_ts
+                    and n.get("idCode") not in hidden_ids)
+        if count > 0:
+            show_notification(
+                "🔔 你有未读通知",
+                f"还有 {count} 条通知未标记已读，请查看",
+                tk_root=root
+            )
 
     def fetch_and_render(self, force=False):
         """Fetch unfinished tasks in a background thread, then render on completion.
@@ -926,7 +959,8 @@ class DashboardFrame(tk.Frame):
                     if len(new_unread_notices) > 3:
                         show_notification("🔔 更多新通知", f"还有 {len(new_unread_notices)-3} 个新通知未查看", tk_root=root)
                     has_new_notice = True
-                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids)
+                    new_unread_ids = [n.get("idCode") for n in new_unread_notices if n.get("idCode")]
+                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids, unread_notice_ids=new_unread_ids)
                 elif notice_count != last_notice_count:
                     # 如果未读通知数改变但没发现新未读条目（如手机上已读），更新基线
                     save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids)
@@ -950,17 +984,18 @@ class DashboardFrame(tk.Frame):
 
         self.tasks_list = tasks
         
-        hw_count = sum(1 for t in tasks if t.get("type") == "作业")
-        exam_count = sum(1 for t in tasks if t.get("type") == "考试")
+        # Update task count badges and unread notice badge
+        hw_total = sum(1 for t in tasks if t.get("type") == "作业")
+        exam_total = sum(1 for t in tasks if t.get("type") == "考试")
+        self.lbl_hw_count.configure(text=f"({hw_total})" if hw_total else "")
+        self.lbl_exam_count.configure(text=f"({exam_total})" if exam_total else "")
+        self._update_unread_badges()
         
-        self.lbl_hw_count.configure(text=f"({hw_count})")
-        self.lbl_exam_count.configure(text=f"({exam_count})")
-        
-        total = hw_count + exam_count
+        total = hw_total + exam_total
         if total == 0:
             self.lbl_loading.configure(text="🎉 没有未完成的作业或考试！", fg=THEME["success"])
         else:
-            self.lbl_loading.configure(text=f"共扫描到 {total} 个未完成任务（作业 {hw_count} | 考试 {exam_count}）", fg=THEME["fg_dim"])
+            self.lbl_loading.configure(text=f"共扫描到 {total} 个未完成任务（作业 {hw_total} | 考试 {exam_total}）", fg=THEME["fg_dim"])
         
         self.render_current_tasks()
 
@@ -998,6 +1033,11 @@ class DashboardFrame(tk.Frame):
                     tk_root=root
                 )
             # 自动轮询且无新任务 → 不弹窗，静默更新
+
+        # ===== 持久未读提醒：自动轮询时检查是否有未确认的通知 =====
+        if not manual:
+            self._check_unread_reminder(root)
+
         # 保存当前任务状态（用于下次启动时对比）
         save_task_state(self.tasks_list, notice_count=notice_count if notice_count >= 0 else None, seen_notice_ids=fetched_ids if notice_count >= 0 else None)
         # 重新调度后台轮询
@@ -1029,8 +1069,10 @@ class DashboardFrame(tk.Frame):
                                font=("Microsoft YaHei", 14), pady=60)
                 lbl.pack(fill="x")
                 return
+            unread_ids = set(state.get("unread_notice_ids", []))
             for notice in visible_notices:
-                self._create_notice_card(parent, notice)
+                nid = notice.get("idCode") or notice.get("uuid", "")
+                self._create_notice_card(parent, notice, is_notice_unread=nid in unread_ids if nid else True)
             return
 
         filtered = [t for t in self.tasks_list if t.get("type") == self.current_tab]
@@ -1142,7 +1184,7 @@ class DashboardFrame(tk.Frame):
             if hasattr(w, 'configure') and 'cursor' in w.keys():
                 w.configure(cursor="hand2")
 
-    def _create_notice_card(self, parent, notice):
+    def _create_notice_card(self, parent, notice, is_notice_unread=True):
         """Create a single styled notice card widget."""
         card = tk.Frame(parent, bg=THEME["card_bg"], padx=16, pady=12, cursor="hand2")
         card.pack(fill="x", padx=5, pady=4)
@@ -1192,6 +1234,19 @@ class DashboardFrame(tk.Frame):
         lbl_web = tk.Label(bottom_row, text="🌐 网页查看", bg=THEME["card_bg"], fg=THEME["badge_hw"],
                            font=("Microsoft YaHei", 9, "underline"))
         lbl_web.pack(side="right", padx=(0, 15))
+
+        # Mark as read button
+        notice_id = notice.get("idCode") or notice.get("uuid", "")
+        is_notice_acked = not is_notice_unread
+        lbl_mark_read = tk.Label(
+            bottom_row,
+            text="✓ 已读" if is_notice_acked else "标为已读",
+            bg=THEME["card_bg"],
+            fg=THEME["fg_muted"] if is_notice_acked else THEME["badge_hw"],
+            font=("Microsoft YaHei", 9),
+            cursor="hand2",
+        )
+        lbl_mark_read.pack(side="right", padx=(0, 15))
         
         lbl_delete = tk.Label(bottom_row, text="🗑️ 删除", bg=THEME["card_bg"], fg=THEME["error"],
                              font=("Microsoft YaHei", 9, "underline"))
@@ -1203,18 +1258,27 @@ class DashboardFrame(tk.Frame):
         def on_enter(e):
             for w in [card, top_row, bottom_row]:
                 w.configure(bg=THEME["card_hover"])
-            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete]:
+            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete, lbl_mark_read]:
                 w.configure(bg=THEME["card_hover"])
                 
         def on_leave(e):
             for w in [card, top_row, bottom_row]:
                 w.configure(bg=THEME["card_bg"])
-            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete]:
+            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete, lbl_mark_read]:
                 w.configure(bg=THEME["card_bg"])
                 
         def on_click(e):
             self.show_notice_detail_dialog(notice)
             card.destroy()
+
+        def on_notice_mark_read(e):
+            if notice_id:
+                mark_notice_read(notice_id)
+                # Update badge on card
+                lbl_status.configure(text=" 已读 ", bg=THEME["fg_muted"], fg=THEME["fg"])
+                lbl_mark_read.configure(text="✓ 已读", fg=THEME["fg_muted"])
+                lbl_mark_read.unbind("<Button-1>")
+            return "break"
             
         for w in all_widgets:
             w.bind("<Enter>", on_enter)
@@ -1234,6 +1298,9 @@ class DashboardFrame(tk.Frame):
                 # Also mark as read locally and update UI
                 if notice.get("isread") == 0:
                     notice["isread"] = 1
+                    nid = notice.get("idCode") or notice.get("uuid", "")
+                    if nid:
+                        mark_notice_read(nid)
                     from xxt_notifier import load_task_state, save_task_state
                     state = load_task_state()
                     hidden_ids = set(state.get("hidden_notice_ids", []))
@@ -1252,6 +1319,10 @@ class DashboardFrame(tk.Frame):
             return "break"
             
         lbl_web.bind("<Button-1>", open_web)
+
+        # Bind mark-read click (only if notice is still unacknowledged)
+        if is_notice_unread and notice_id:
+            lbl_mark_read.bind("<Button-1>", on_notice_mark_read)
         
         def open_delete(e):
             notice_id = notice.get("idCode")
@@ -1372,7 +1443,10 @@ class DashboardFrame(tk.Frame):
                     
                     # Mark as read locally and save state so count updates
                     notice["isread"] = 1
-                    from xxt_notifier import load_task_state, save_task_state
+                    from xxt_notifier import load_task_state, save_task_state, mark_notice_read
+                    nid = notice.get("idCode") or notice.get("uuid", "")
+                    if nid:
+                        mark_notice_read(nid)
                     state = load_task_state()
                     hidden_ids = set(state.get("hidden_notice_ids", []))
                     cutoff_timestamp = state.get("cutoff_timestamp")
