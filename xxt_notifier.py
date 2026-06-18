@@ -36,7 +36,7 @@ import base64
 # ============================================================
 
 # 当前版本号 —— 每次发布新版本时更新此值，并在 GitHub 创建对应 Release
-CURRENT_VERSION = "1.0.1"
+CURRENT_VERSION = "1.0.2"
 
 # GitHub 仓库地址（用于检查更新）
 GITHUB_REPO = "liusonglei796/xxnotice"
