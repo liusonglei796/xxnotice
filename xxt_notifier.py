@@ -726,20 +726,125 @@ class XuexitongClient:
         now = datetime.now()
         timestamp_str = now.strftime("%a %b %d %Y %H:%M:%S") + " GMT+0800 (中国标准时间)"
         try:
-            resp = self.session.post(
+            resp = self.session.get(
                 NOTICE_COUNT_URL,
-                data={"_t": timestamp_str},
+                params={"_t": timestamp_str},
                 headers=XHR_HEADERS,
                 timeout=10,
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("status") == True:
-                    return int(data.get("count", 0))
+                    msg_val = data.get("msg")
+                    if isinstance(msg_val, bool):
+                        return 0
+                    elif isinstance(msg_val, int):
+                        return msg_val
+                    try:
+                        return int(msg_val)
+                    except (ValueError, TypeError):
+                        return 0
                 return 0
         except Exception as e:
             logger.warning(f"通知数请求失败: {e}")
         return -1
+
+    def get_notice_list(self, year: str) -> dict:
+        """
+        获取接收到的通知列表。
+        API: notice.chaoxing.com/pc/notice/getNoticeList
+        """
+        url = "https://notice.chaoxing.com/pc/notice/getNoticeList"
+        payload = {
+            "type": "2",
+            "notice_type": "",
+            "lastValue": "",
+            "sort": "",
+            "folderUUID": "",
+            "kw": "",
+            "startTime": "",
+            "endTime": "",
+            "gKw": "",
+            "gName": "",
+            "year": year,
+            "tag": "",
+            "fidsCode": "",
+            "queryFolderNoticePrevYear": "0",
+            "filterSenderPuids": "",
+            "filterTags": ""
+        }
+        try:
+            resp = self.session.post(
+                url,
+                data=payload,
+                headers={
+                    **XHR_HEADERS,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"获取通知列表失败: {e}")
+        return {}
+
+    def get_notice_detail(self, notice_id: str, send_tag: str = "0") -> dict:
+        """
+        获取通知详情 JSON。
+        API: notice.chaoxing.com/pc/notice/{notice_id}/getNoticeDetail?sendTag={send_tag}
+        """
+        if notice_id == "mock-uuid-simulation-999" or notice_id == "MOCK_NOTICE_SIMULATION_999":
+            return {
+                "status": True,
+                "msg": {
+                    "content": "恭喜！您成功模拟了一条未读通知到达。这是详情窗口中展示的正文内容。\n\n您可以在消息列表中看到该条通知，它的右上角显示红色“未读”角标。在卡片右下角点击“网页查看”链接，会直接调起您的默认浏览器打开超星详情页，并且本条通知的状态会被本地立刻置为“已读”，主面板上的未读计数角标也会自动扣减 1。"
+                }
+            }
+        url = f"https://notice.chaoxing.com/pc/notice/{notice_id}/getNoticeDetail"
+        params = {"sendTag": send_tag}
+        try:
+            resp = self.session.get(
+                url,
+                params=params,
+                headers=XHR_HEADERS,
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.warning(f"获取通知详情失败: {e}")
+        return {}
+
+    def delete_notice(self, notice_ids: str, send_tag: str = "0") -> bool:
+        """
+        删除通知（移入回收站）。
+        API: notice.chaoxing.com/pc/notice/delNoitce
+        """
+        if notice_ids == "mock-uuid-simulation-999" or notice_ids == "MOCK_NOTICE_SIMULATION_999":
+            # Just pretend mock notice was successfully deleted
+            return True
+        url = "https://notice.chaoxing.com/pc/notice/delNoitce"
+        payload = {
+            "noticeIds": notice_ids,
+            "sendTag": send_tag
+        }
+        try:
+            resp = self.session.post(
+                url,
+                data=payload,
+                headers={
+                    **XHR_HEADERS,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return resp.json().get("status") == True
+        except Exception as e:
+            logger.warning(f"删除通知失败: {e}")
+        return False
+
 
     # ----- 课程列表 -----
 
@@ -1368,6 +1473,97 @@ _KNOWN_UNFINISHED = frozenset({"未交", "进行中", "待做"})
 
 
 
+def load_task_state() -> dict:
+    """
+    从 state.json 加载已保存的任务状态。
+    返回格式: {"seen_keys": ["课程|任务名|类型", ...], "last_scan": 时间戳, "last_notice_count": 0, "seen_notice_ids": [], "hidden_notice_ids": [], "baseline_notice_ids": [], "cutoff_timestamp": None}
+    被 GUI 启动时调用，用于对比检测新任务和新通知。
+    """
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if "seen_keys" not in data:
+                data["seen_keys"] = []
+            if "seen_notice_ids" not in data:
+                data["seen_notice_ids"] = []
+            if "hidden_notice_ids" not in data:
+                data["hidden_notice_ids"] = []
+            if "baseline_notice_ids" not in data:
+                data["baseline_notice_ids"] = []
+            if "cutoff_timestamp" not in data:
+                data["cutoff_timestamp"] = None
+            return data
+    except Exception as e:
+        logger.warning(f"加载 state.json 失败: {e}")
+    return {"seen_keys": [], "seen_notice_ids": [], "hidden_notice_ids": [], "baseline_notice_ids": [], "cutoff_timestamp": None}
+
+
+def save_task_state(tasks: list, notice_count: Optional[int] = None, seen_notice_ids: Optional[list] = None, hidden_notice_ids: Optional[list] = None, baseline_notice_ids: Optional[list] = None, cutoff_timestamp: Optional[int] = None):
+    """
+    将当前任务列表、通知数量和已见通知 IDs 写入 state.json。
+    seen_keys 累积保存（旧 key 保留 + 新 key 追加），避免重复通知。
+    被 GUI 每次扫描完成后调用。
+    """
+    # 计算当前所有任务 of 特征 key
+    current_keys = set()
+    for t in tasks:
+        key = f"{t.get('course','')}|{t.get('name','')}|{t.get('type','')}"
+        current_keys.add(key)
+
+    try:
+        old = load_task_state()
+        old_seen = set(old.get("seen_keys", []))
+        # 合并旧 key（历史已通知的）和新 key（当前任务）
+        old_seen.update(current_keys)
+        state = {
+            "seen_keys": sorted(old_seen),
+            "last_scan": time.time(),
+        }
+        if notice_count is not None:
+            state["last_notice_count"] = notice_count
+        elif "last_notice_count" in old:
+            state["last_notice_count"] = old["last_notice_count"]
+
+        if seen_notice_ids is not None:
+            old_notice_seen = set(old.get("seen_notice_ids", []))
+            old_notice_seen.update(seen_notice_ids)
+            state["seen_notice_ids"] = sorted(old_notice_seen)
+        elif "seen_notice_ids" in old:
+            state["seen_notice_ids"] = old["seen_notice_ids"]
+
+        if hidden_notice_ids is not None:
+            old_hidden = set(old.get("hidden_notice_ids", []))
+            old_hidden.update(hidden_notice_ids)
+            state["hidden_notice_ids"] = sorted(old_hidden)
+        elif "hidden_notice_ids" in old:
+            state["hidden_notice_ids"] = old["hidden_notice_ids"]
+        else:
+            state["hidden_notice_ids"] = []
+
+        if baseline_notice_ids is not None:
+            old_baseline = set(old.get("baseline_notice_ids", []))
+            old_baseline.update(baseline_notice_ids)
+            state["baseline_notice_ids"] = sorted(old_baseline)
+        elif "baseline_notice_ids" in old:
+            state["baseline_notice_ids"] = old["baseline_notice_ids"]
+        else:
+            state["baseline_notice_ids"] = []
+
+        if cutoff_timestamp is not None:
+            state["cutoff_timestamp"] = cutoff_timestamp
+        elif "cutoff_timestamp" in old:
+            state["cutoff_timestamp"] = old["cutoff_timestamp"]
+        else:
+            state["cutoff_timestamp"] = None
+
+        STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"保存 state.json 失败: {e}")
+
+
 def _is_unfinished(status: str) -> bool:
     """
     判断作业/考试状态是否为"未完成"
@@ -1537,49 +1733,43 @@ def set_autostart(enable: bool) -> bool:
 STATE_FILE = BASE_DIR / "state.json"
 
 
-def load_task_state() -> dict:
+def extract_notices(data: dict) -> list:
     """
-    从 state.json 加载已保存的任务状态。
-    返回格式: {"seen_keys": ["课程|任务名|类型", ...], "last_scan": 时间戳}
-    被 GUI 启动时调用，用于对比检测新任务。
+    从 getNoticeList 返回的 JSON 数据中提取所有通知列表并进行去重。
     """
-    try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"加载 state.json 失败: {e}")
-    return {"seen_keys": []}
-
-
-def save_task_state(tasks: list):
-    """
-    将当前任务列表写入 state.json。
-    seen_keys 累积保存（旧 key 保留 + 新 key 追加），避免重复通知。
-    被 GUI 每次扫描完成后调用。
-    """
-    # 计算当前所有任务的特征 key
-    current_keys = set()
-    for t in tasks:
-        key = f"{t.get('course','')}|{t.get('name','')}|{t.get('type','')}"
-        current_keys.add(key)
-
-    try:
-        old = load_task_state()
-        old_seen = set(old.get("seen_keys", []))
-        # 合并旧 key（历史已通知的）和新 key（当前任务）
-        old_seen.update(current_keys)
-        state = {
-            "seen_keys": sorted(old_seen),
-            "last_scan": time.time(),
-        }
-        STATE_FILE.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-    except Exception as e:
-        logger.warning(f"保存 state.json 失败: {e}")
-
-
+    out = []
+    if not isinstance(data, dict):
+        return out
+    
+    # 1. 提取置顶通知
+    top_notices = data.get("topNotices")
+    if isinstance(top_notices, list):
+        out.extend(top_notices)
+        
+    # 2. 提取紧急通知
+    urgent_notices = data.get("urgentNotices")
+    if isinstance(urgent_notices, list):
+        out.extend(urgent_notices)
+        
+    # 3. 提取普通通知
+    notices_dict = data.get("notices")
+    if isinstance(notices_dict, dict):
+        normal_list = notices_dict.get("list")
+        if isinstance(normal_list, list):
+            out.extend(normal_list)
+            
+    # 去重（基于 idCode）
+    seen = set()
+    unique_out = []
+    for item in out:
+        if not isinstance(item, dict):
+            continue
+        id_code = item.get("idCode")
+        if id_code and id_code not in seen:
+            seen.add(id_code)
+            unique_out.append(item)
+            
+    return unique_out
 def find_new_tasks(current_tasks: list) -> list:
     """
     对比 state.json 中的 seen_keys，找出 current_tasks 中从未见过的新任务。

@@ -679,7 +679,8 @@ class DashboardFrame(tk.Frame):
         self.controller = controller
         
         self.tasks_list = []  # List of all uncompleted task dicts
-        self.current_tab = "作业"  # '作业' or '考试'
+        self.notices_list = []  # List of all inbox notices
+        self.current_tab = "作业"  # '作业' or '考试' or '通知'
         self._is_fetching = False
         self._poll_job_id = None  # 后台轮询定时器 ID，用于取消/防堆叠
         self.is_first_scan = True
@@ -726,14 +727,19 @@ class DashboardFrame(tk.Frame):
         nav_bar.pack(side="top", fill="x", pady=(15, 2))
         
         self.btn_tab_hw = tk.Button(nav_bar, text="📝 未完成作业", bg=THEME["accent"], fg=THEME["fg"],
-                                    font=("Microsoft YaHei", 11, "bold"), bd=0, relief="flat", width=18,
+                                    font=("Microsoft YaHei", 11, "bold"), bd=0, relief="flat", width=14,
                                     command=lambda: self.switch_tab("作业"))
         self.btn_tab_hw.pack(side="left", padx=(0, 10), ipady=6)
         
         self.btn_tab_exam = tk.Button(nav_bar, text="📋 未完成考试", bg=THEME["card_bg"], fg=THEME["fg_dim"],
-                                     font=("Microsoft YaHei", 11, "bold"), bd=0, relief="flat", width=18,
+                                     font=("Microsoft YaHei", 11, "bold"), bd=0, relief="flat", width=14,
                                      command=lambda: self.switch_tab("考试"))
         self.btn_tab_exam.pack(side="left", ipady=6)
+
+        self.btn_tab_notice = tk.Button(nav_bar, text="🔔 消息通知", bg=THEME["card_bg"], fg=THEME["fg_dim"],
+                                       font=("Microsoft YaHei", 11, "bold"), bd=0, relief="flat", width=14,
+                                       command=lambda: self.switch_tab("通知"))
+        self.btn_tab_notice.pack(side="left", padx=(10, 0), ipady=6)
         
         # Task count badges
         self.lbl_hw_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["badge_hw"], font=("Microsoft YaHei", 10, "bold"))
@@ -741,6 +747,9 @@ class DashboardFrame(tk.Frame):
         
         self.lbl_exam_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["badge_exam"], font=("Microsoft YaHei", 10, "bold"))
         self.lbl_exam_count.pack(side="left", padx=(5, 0))
+
+        self.lbl_notice_count = tk.Label(nav_bar, text="", bg=THEME["bg"], fg=THEME["success"], font=("Microsoft YaHei", 10, "bold"))
+        self.lbl_notice_count.pack(side="left", padx=(5, 0))
 
         # Loading Indicator Label
         self.lbl_loading = tk.Label(self, text="", bg=THEME["bg"], fg=THEME["fg_dim"], font=("Microsoft YaHei", 10))
@@ -799,21 +808,129 @@ class DashboardFrame(tk.Frame):
             except Exception as e:
                 logger.error(f"[GUI] Fetch error: {e}")
                 tasks = []
+
+            # 获取未读通知数和通知列表数据
+            notice_count = -1
+            new_notices_data = {}
+            try:
+                if self.controller.client._uid:
+                    notice_count = self.controller.client.get_notice_count()
+                    if notice_count >= 0:
+                        from datetime import datetime
+                        current_year = str(datetime.now().year)
+                        new_notices_data = self.controller.client.get_notice_list(year=current_year)
+            except Exception as e:
+                logger.error(f"[GUI] Fetch notice count or list error: {e}")
+
             # Schedule UI update on the main thread
             # 注意：不再在扫面前清空卡片，而是扫完后有数据才替换，
             # 避免扫描过程中出现白屏，也避免扫描返回空时清掉上次结果
-            self.after(0, lambda: self._on_fetch_complete(tasks, manual=manual))
+            self.after(0, lambda: self._on_fetch_complete(tasks, notice_count=notice_count, new_notices_data=new_notices_data, manual=manual))
         
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
 
-    def _on_fetch_complete(self, tasks, manual=False):
+    def _on_fetch_complete(self, tasks, notice_count=-1, new_notices_data=None, manual=False):
         """Called on the main thread after background fetch completes.
         参数:
             tasks: 扫描到的任务列表
+            notice_count: 扫描到的未读通知数
+            new_notices_data: 扫描到的通知列表 JSON 数据
             manual: True=手动刷新，完成后弹通知；False=自动轮询，有新任务才弹。
         """
         self._is_fetching = False
+
+        # ===== 优先处理新通知弹窗与状态保存 =====
+        from xxt_notifier import load_task_state, save_task_state, extract_notices
+        state = load_task_state()
+        root = self.controller.root
+        has_new_notice = False
+
+        fetched_notices = extract_notices(new_notices_data)
+        fetched_ids = [n.get("idCode") for n in fetched_notices if n.get("idCode")]
+
+        if notice_count >= 0:
+            self.notices_list = fetched_notices
+            hidden_ids = set(state.get("hidden_notice_ids", []))
+            
+            cutoff_timestamp = state.get("cutoff_timestamp")
+            if not cutoff_timestamp:
+                import datetime
+                now = datetime.datetime.now()
+                today_start = datetime.datetime(now.year, now.month, now.day)
+                cutoff_timestamp = int(today_start.timestamp() * 1000)
+                logger.info(f"[GUI] 首次扫描建立截止时间基线: {today_start.strftime('%Y-%m-%d %H:%M:%S')}")
+                save_task_state(self.tasks_list, cutoff_timestamp=cutoff_timestamp)
+
+            unread_notice_count = sum(1 for n in fetched_notices if n.get("isread") == 0 and n.get("insertTime", 0) >= cutoff_timestamp and n.get("idCode") not in hidden_ids)
+            self.lbl_notice_count.configure(text=f"({unread_notice_count})")
+
+            if "last_notice_count" not in state:
+                # 首次获取通知数：静默建立基线
+                logger.info(f"[GUI] 首次获取通知数，静默建立基线: {notice_count}")
+                save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids, cutoff_timestamp=cutoff_timestamp)
+            else:
+                last_notice_count = state["last_notice_count"]
+                seen_notice_ids = set(state.get("seen_notice_ids", []))
+                new_unread_notices = []
+                
+                for item in fetched_notices:
+                    id_code = item.get("idCode")
+                    if id_code and id_code not in seen_notice_ids and item.get("isread") == 0 and item.get("insertTime", 0) >= cutoff_timestamp:
+                        new_unread_notices.append(item)
+                        
+                if new_unread_notices:
+                    # 弹窗提示具体通知内容
+                    for item in new_unread_notices[:3]:
+                        creater = item.get("createrName") or "未知发送人"
+                        title = item.get("title") or "无标题通知"
+                        import time
+                        insert_time = item.get("insertTime", 0)
+                        time_str = "未知时间"
+                        if insert_time:
+                            try:
+                                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(insert_time / 1000))
+                            except Exception:
+                                pass
+                        
+                        # 尝试获取通知正文
+                        content_body = ""
+                        notice_id = item.get("uuid") or item.get("idCode")
+                        if notice_id:
+                            send_tag = str(item.get("sendTag", "0"))
+                            try:
+                                detail_res = self.controller.client.get_notice_detail(notice_id, send_tag)
+                                if detail_res.get("status") == True:
+                                    msg_data = detail_res.get("msg", {})
+                                    if isinstance(msg_data, dict):
+                                        raw_content = msg_data.get("content", "")
+                                        if raw_content:
+                                            import html
+                                            import re
+                                            unescaped = html.unescape(raw_content)
+                                            content_body = re.sub(r'\s+', ' ', unescaped).strip()
+                                            if len(content_body) > 100:
+                                                content_body = content_body[:97] + "..."
+                            except Exception as e:
+                                logger.warning(f"获取通知详情正文失败: {e}")
+                        
+                        msg_text = f"发件人：{creater}\n标题：{title}\n时间：{time_str}"
+                        if content_body:
+                            msg_text += f"\n内容：{content_body}"
+
+                        show_notification(
+                            "🔔 收件箱新通知",
+                            msg_text,
+                            tk_root=root
+                        )
+                    if len(new_unread_notices) > 3:
+                        show_notification("🔔 更多新通知", f"还有 {len(new_unread_notices)-3} 个新通知未查看", tk_root=root)
+                    has_new_notice = True
+                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids)
+                elif notice_count != last_notice_count:
+                    # 如果未读通知数改变但没发现新未读条目（如手机上已读），更新基线
+                    save_task_state(self.tasks_list, notice_count=notice_count, seen_notice_ids=fetched_ids)
+
         # GUI 只显示有截止时间的任务，无截止时间的全部过滤掉
         tasks = [t for t in tasks if t.get("deadline", "") != "无截止时间"]
         self.btn_refresh.configure(state="normal", text="刷 新 🔄")
@@ -827,7 +944,8 @@ class DashboardFrame(tk.Frame):
                 text="⚠️ 本次扫描被反爬限流，未获取到新数据（显示上次结果）",
                 fg=THEME["deadline_warn"]
             )
-            # 恢复刷新按钮状态，不更新显示
+            # 恢复刷新按钮状态，不更新显示并重新调度轮询
+            self.schedule_poll()
             return
 
         self.tasks_list = tasks
@@ -847,10 +965,7 @@ class DashboardFrame(tk.Frame):
         self.render_current_tasks()
 
         # ===== 检测新任务 → 弹窗通知 =====
-        from xxt_notifier import load_task_state
-        state = load_task_state()
         is_first_run = not state.get("seen_keys")
-        root = self.controller.root
 
         if is_first_run:
             # 首次运行：静默建立基线，不弹新任务通知
@@ -875,8 +990,8 @@ class DashboardFrame(tk.Frame):
                     )
                 if len(new_tasks) > 3:
                     show_notification("📚 更多新任务", f"还有 {len(new_tasks)-3} 个新任务未查看", tk_root=root)
-            elif manual:
-                # 手动刷新且没有新任务：弹完成通知，避免点了刷新没反应
+            elif manual and not has_new_notice:
+                # 手动刷新且没有新任务也无新通知：弹完成通知，避免点了刷新没反应
                 show_notification(
                     "✅ 扫描完成",
                     "没有新发布的作业或考试",
@@ -884,7 +999,7 @@ class DashboardFrame(tk.Frame):
                 )
             # 自动轮询且无新任务 → 不弹窗，静默更新
         # 保存当前任务状态（用于下次启动时对比）
-        save_task_state(self.tasks_list)
+        save_task_state(self.tasks_list, notice_count=notice_count if notice_count >= 0 else None, seen_notice_ids=fetched_ids if notice_count >= 0 else None)
         # 重新调度后台轮询
         self.schedule_poll()
 
@@ -898,6 +1013,26 @@ class DashboardFrame(tk.Frame):
         self._clear_task_cards()
         parent = self.scroll_frame.scrollable_frame
         
+        if self.current_tab == "通知":
+            from xxt_notifier import load_task_state
+            state = load_task_state()
+            hidden_ids = set(state.get("hidden_notice_ids", []))
+            cutoff_timestamp = state.get("cutoff_timestamp")
+            if not cutoff_timestamp:
+                import datetime
+                now = datetime.datetime.now()
+                today_start = datetime.datetime(now.year, now.month, now.day)
+                cutoff_timestamp = int(today_start.timestamp() * 1000)
+            visible_notices = [n for n in self.notices_list if n.get("isread") == 0 and n.get("insertTime", 0) >= cutoff_timestamp and n.get("idCode") not in hidden_ids]
+            if not visible_notices:
+                lbl = tk.Label(parent, text="📭 暂无通知消息", bg=THEME["bg"], fg=THEME["fg_dim"],
+                               font=("Microsoft YaHei", 14), pady=60)
+                lbl.pack(fill="x")
+                return
+            for notice in visible_notices:
+                self._create_notice_card(parent, notice)
+            return
+
         filtered = [t for t in self.tasks_list if t.get("type") == self.current_tab]
         
         if not filtered:
@@ -1007,14 +1142,272 @@ class DashboardFrame(tk.Frame):
             if hasattr(w, 'configure') and 'cursor' in w.keys():
                 w.configure(cursor="hand2")
 
+    def _create_notice_card(self, parent, notice):
+        """Create a single styled notice card widget."""
+        card = tk.Frame(parent, bg=THEME["card_bg"], padx=16, pady=12, cursor="hand2")
+        card.pack(fill="x", padx=5, pady=4)
+        
+        # Top row: title + status badge
+        top_row = tk.Frame(card, bg=THEME["card_bg"])
+        top_row.pack(fill="x")
+        
+        title = notice.get("title", "无标题通知")
+        lbl_title = tk.Label(top_row, text=title, bg=THEME["card_bg"], fg=THEME["fg"],
+                             font=("Microsoft YaHei", 11, "bold"), anchor="w")
+        lbl_title.pack(side="left", fill="x", expand=True)
+        
+        # Status badge (Unread vs Read)
+        is_read = notice.get("isread", 0)
+        badge_text = " 未读 " if is_read == 0 else " 已读 "
+        badge_color = THEME["error"] if is_read == 0 else THEME["fg_muted"]
+        badge_fg = "#1e1e2e" if is_read == 0 else THEME["fg"]
+        
+        lbl_status = tk.Label(top_row, text=badge_text, bg=badge_color, fg=badge_fg,
+                              font=("Microsoft YaHei", 9, "bold"), padx=6, pady=1)
+        lbl_status.pack(side="right")
+        
+        # Bottom row: sender + time + click hint
+        bottom_row = tk.Frame(card, bg=THEME["card_bg"])
+        bottom_row.pack(fill="x", pady=(6, 0))
+        
+        creater = notice.get("createrName") or "未知发送人"
+        import time
+        insert_time = notice.get("insertTime", 0)
+        time_str = "未知时间"
+        if insert_time:
+            try:
+                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(insert_time / 1000))
+            except Exception:
+                pass
+                
+        info_text = f"👤 {creater}  |  时间: {time_str}"
+        lbl_info = tk.Label(bottom_row, text=info_text, bg=THEME["card_bg"], fg=THEME["fg_muted"],
+                            font=("Microsoft YaHei", 9), anchor="w")
+        lbl_info.pack(side="left")
+        
+        lbl_hint = tk.Label(bottom_row, text="点击查看正文 →", bg=THEME["card_bg"], fg=THEME["accent"],
+                            font=("Microsoft YaHei", 9))
+        lbl_hint.pack(side="right")
+        
+        lbl_web = tk.Label(bottom_row, text="🌐 网页查看", bg=THEME["card_bg"], fg=THEME["badge_hw"],
+                           font=("Microsoft YaHei", 9, "underline"))
+        lbl_web.pack(side="right", padx=(0, 15))
+        
+        lbl_delete = tk.Label(bottom_row, text="🗑️ 删除", bg=THEME["card_bg"], fg=THEME["error"],
+                             font=("Microsoft YaHei", 9, "underline"))
+        lbl_delete.pack(side="right", padx=(0, 15))
+        
+        # Hover effect & click handler
+        all_widgets = [card, top_row, bottom_row, lbl_title, lbl_status, lbl_info, lbl_hint, lbl_web, lbl_delete]
+        
+        def on_enter(e):
+            for w in [card, top_row, bottom_row]:
+                w.configure(bg=THEME["card_hover"])
+            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete]:
+                w.configure(bg=THEME["card_hover"])
+                
+        def on_leave(e):
+            for w in [card, top_row, bottom_row]:
+                w.configure(bg=THEME["card_bg"])
+            for w in [lbl_title, lbl_info, lbl_hint, lbl_web, lbl_delete]:
+                w.configure(bg=THEME["card_bg"])
+                
+        def on_click(e):
+            self.show_notice_detail_dialog(notice)
+            card.destroy()
+            
+        for w in all_widgets:
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<Button-1>", on_click)
+            if hasattr(w, 'configure') and 'cursor' in w.keys():
+                w.configure(cursor="hand2")
+                
+        def open_web(e):
+            notice_id = notice.get("uuid") or notice.get("idCode")
+            send_tag = str(notice.get("sendTag", "0"))
+            if notice_id:
+                web_url = f"https://notice.chaoxing.com/pc/notice/{notice_id}/detail?sendTag={send_tag}"
+                import webbrowser
+                webbrowser.open(web_url)
+                
+                # Also mark as read locally and update UI
+                if notice.get("isread") == 0:
+                    notice["isread"] = 1
+                    from xxt_notifier import load_task_state, save_task_state
+                    state = load_task_state()
+                    hidden_ids = set(state.get("hidden_notice_ids", []))
+                    cutoff_timestamp = state.get("cutoff_timestamp")
+                    if not cutoff_timestamp:
+                        import datetime
+                        now = datetime.datetime.now()
+                        today_start = datetime.datetime(now.year, now.month, now.day)
+                        cutoff_timestamp = int(today_start.timestamp() * 1000)
+                    unread_count = sum(1 for n in self.notices_list if n.get("isread") == 0 and n.get("insertTime", 0) >= cutoff_timestamp and n.get("idCode") not in hidden_ids)
+                    self.lbl_notice_count.configure(text=f"({unread_count})")
+                    card.destroy()
+                    
+                    fetched_ids = [n.get("idCode") for n in self.notices_list if n.get("idCode")]
+                    save_task_state(self.tasks_list, notice_count=len(self.notices_list), seen_notice_ids=fetched_ids)
+            return "break"
+            
+        lbl_web.bind("<Button-1>", open_web)
+        
+        def open_delete(e):
+            notice_id = notice.get("idCode")
+            if notice_id:
+                from tkinter import messagebox
+                if messagebox.askyesno("确认隐藏", "确定要在本地隐藏这条通知吗？（学习通服务器端仍会保留）"):
+                    from xxt_notifier import load_task_state, save_task_state
+                    state = load_task_state()
+                    hidden_notice_ids = state.get("hidden_notice_ids", [])
+                    if notice_id not in hidden_notice_ids:
+                        hidden_notice_ids.append(notice_id)
+                    
+                    hidden_ids = set(hidden_notice_ids)
+                    cutoff_timestamp = state.get("cutoff_timestamp")
+                    if not cutoff_timestamp:
+                        import datetime
+                        now = datetime.datetime.now()
+                        today_start = datetime.datetime(now.year, now.month, now.day)
+                        cutoff_timestamp = int(today_start.timestamp() * 1000)
+                    unread_count = sum(1 for n in self.notices_list if n.get("isread") == 0 and n.get("insertTime", 0) >= cutoff_timestamp and n.get("idCode") not in hidden_ids)
+                    self.lbl_notice_count.configure(text=f"({unread_count})")
+                    card.destroy()
+                    
+                    fetched_ids = [n.get("idCode") for n in self.notices_list if n.get("idCode")]
+                    save_task_state(self.tasks_list, notice_count=len(self.notices_list), seen_notice_ids=fetched_ids, hidden_notice_ids=hidden_notice_ids)
+            return "break"
+            
+        lbl_delete.bind("<Button-1>", open_delete)
+
+    def show_notice_detail_dialog(self, notice):
+        """Open a custom popup dialog displaying the full body of a notice."""
+        # Create dialog
+        dialog = tk.Toplevel(self.controller.root)
+        dialog.title("通知详情")
+        dialog.configure(bg=THEME["bg"])
+        
+        # Center the dialog
+        W, H = 520, 420
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        x = (screen_w - W) // 2
+        y = (screen_h - H) // 2
+        dialog.geometry(f"{W}x{H}+{x}+{y}")
+        dialog.transient(self.controller.root)
+        dialog.grab_set()
+        
+        # Frame
+        main_frame = tk.Frame(dialog, bg=THEME["bg"], padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True)
+        
+        # Title
+        title = notice.get("title", "无标题通知")
+        lbl_title = tk.Label(main_frame, text=title, bg=THEME["bg"], fg=THEME["fg"],
+                             font=("Microsoft YaHei", 12, "bold"), wraplength=480, justify="left", anchor="w")
+        lbl_title.pack(fill="x", pady=(0, 6))
+        
+        # Sender + Time
+        creater = notice.get("createrName") or "未知发送人"
+        import time
+        insert_time = notice.get("insertTime", 0)
+        time_str = "未知时间"
+        if insert_time:
+            try:
+                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(insert_time / 1000))
+            except Exception:
+                pass
+        
+        lbl_info = tk.Label(main_frame, text=f"发件人：{creater}    时间：{time_str}", bg=THEME["bg"], fg=THEME["fg_muted"],
+                            font=("Microsoft YaHei", 9), anchor="w")
+        lbl_info.pack(fill="x", pady=(0, 10))
+        
+        # Separator
+        sep = tk.Frame(main_frame, bg=THEME["border"], height=1)
+        sep.pack(fill="x", pady=(0, 15))
+        
+        # Content body (with loading indication first)
+        lbl_loading = tk.Label(main_frame, text="⏳ 正在加载通知正文...", bg=THEME["bg"], fg=THEME["fg_dim"],
+                               font=("Microsoft YaHei", 11))
+        lbl_loading.pack(fill="both", expand=True)
+        
+        # Fetch in thread
+        def load_body():
+            notice_id = notice.get("uuid") or notice.get("idCode")
+            send_tag = str(notice.get("sendTag", "0"))
+            content_text = "获取正文失败，请前往学习通网页或App查看。"
+            if notice_id:
+                try:
+                    res = self.controller.client.get_notice_detail(notice_id, send_tag)
+                    if res.get("status") == True:
+                        msg_data = res.get("msg", {})
+                        if isinstance(msg_data, dict):
+                            content_text = msg_data.get("content", "").strip()
+                            if not content_text:
+                                content_text = "（此通知无文字内容，可能是富媒体/图片/附件，请前往网页或App查看详情）"
+                except Exception as e:
+                    content_text = f"加载失败: {e}"
+            
+            # Update UI on main thread
+            import html
+            final_text = html.unescape(content_text)
+            
+            def update_ui():
+                try:
+                    lbl_loading.destroy()
+                    
+                    txt_frame = tk.Frame(main_frame, bg=THEME["bg"])
+                    txt_frame.pack(fill="both", expand=True)
+                    
+                    scrollbar = tk.Scrollbar(txt_frame)
+                    scrollbar.pack(side="right", fill="y")
+                    
+                    txt_area = tk.Text(txt_frame, bg=THEME["card_bg"], fg=THEME["fg_dim"], bd=0, highlightthickness=0,
+                                       font=("Microsoft YaHei", 10), wrap="word", yscrollcommand=scrollbar.set, padx=12, pady=12)
+                    txt_area.insert("1.0", final_text)
+                    txt_area.configure(state="disabled") # Read-only
+                    txt_area.pack(side="left", fill="both", expand=True)
+                    scrollbar.config(command=txt_area.yview)
+                    
+                    # Mark as read locally and save state so count updates
+                    notice["isread"] = 1
+                    from xxt_notifier import load_task_state, save_task_state
+                    state = load_task_state()
+                    hidden_ids = set(state.get("hidden_notice_ids", []))
+                    cutoff_timestamp = state.get("cutoff_timestamp")
+                    if not cutoff_timestamp:
+                        import datetime
+                        now = datetime.datetime.now()
+                        today_start = datetime.datetime(now.year, now.month, now.day)
+                        cutoff_timestamp = int(today_start.timestamp() * 1000)
+                    unread_count = sum(1 for n in self.notices_list if n.get("isread") == 0 and n.get("insertTime", 0) >= cutoff_timestamp and n.get("idCode") not in hidden_ids)
+                    self.lbl_notice_count.configure(text=f"({unread_count})")
+                    
+                    fetched_ids = [n.get("idCode") for n in self.notices_list if n.get("idCode")]
+                    save_task_state(self.tasks_list, notice_count=len(self.notices_list), seen_notice_ids=fetched_ids)
+                except Exception:
+                    pass
+                
+            self.after(0, update_ui)
+            
+        import threading
+        threading.Thread(target=load_body, daemon=True).start()
+
     def switch_tab(self, tab_name):
         self.current_tab = tab_name
         if tab_name == "作业":
             self.btn_tab_hw.configure(bg=THEME["accent"], fg=THEME["fg"])
             self.btn_tab_exam.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
-        else:
+            self.btn_tab_notice.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
+        elif tab_name == "考试":
             self.btn_tab_hw.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
             self.btn_tab_exam.configure(bg=THEME["accent"], fg=THEME["fg"])
+            self.btn_tab_notice.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
+        else:  # "通知"
+            self.btn_tab_hw.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
+            self.btn_tab_exam.configure(bg=THEME["card_bg"], fg=THEME["fg_dim"])
+            self.btn_tab_notice.configure(bg=THEME["accent"], fg=THEME["fg"])
         self.render_current_tasks()
 
     def _on_autostart_toggle(self, state):
